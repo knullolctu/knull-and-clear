@@ -4,7 +4,9 @@ dist
 *.log
 .vite
 
-# Models are stored on each user's PC (model library folder), not on GitHub Pages.
-# Local dev can still use public/models via `npm run download-model`.
-public/models/**
-!public/models/.gitkeep
+# Keep huge ONNX variants local-only (need Git LFS + lots of bandwidth).
+# Default q8 (model_quantized.onnx) + voices ARE committed for Pages.
+public/models/**/model.onnx
+public/models/**/model_q4.onnx
+public/models/**/model_fp16.onnx
+public/models/**/model_q4f16.onnx

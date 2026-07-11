@@ -49,11 +49,11 @@ jobs:
         env:
           VITE_BASE: ${{ env.VITE_BASE }}
 
-      - name: Note about models
+      - name: Verify model files in dist
         run: |
-          echo "Pages hosts the app only. Users pick a local model library folder"
-          echo "or load weights from Hugging Face at runtime."
-          ls -la dist | head -20 || true
+          echo "Self-hosted models under dist/models (served with the app on Pages)"
+          find dist/models -type f 2>/dev/null | head -40 || echo "No models in dist (optional)"
+          du -sh dist dist/models 2>/dev/null || true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
