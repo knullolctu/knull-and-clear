@@ -338,12 +338,22 @@ export async function listLibraryModelIds(root) {
  */
 export async function isEntryInLibrary(root, entry) {
   const onnx = onnxFileForDtype(entry.dtype);
-  const files = [`onnx/${onnx}`, "onnx/model_quantized.onnx"];
+  // Exact dtype file first; min size 5MB (q4/fp32 exports vary a lot)
+  const files = [`onnx/${onnx}`, "onnx/model_quantized.onnx", "onnx/model.onnx"];
   for (const f of files) {
     const buf = await readLibraryModelFile(root, entry.modelId, f);
-    if (buf && buf.byteLength >= 1_000_000) return true;
+    if (buf && buf.byteLength >= 5_000_000) {
+      // Prefer exact name match for "present"
+      if (f === `onnx/${onnx}`) return true;
+    }
   }
-  return false;
+  // Exact file only for catalog "downloaded" badge
+  const exact = await readLibraryModelFile(
+    root,
+    entry.modelId,
+    `onnx/${onnx}`,
+  );
+  return Boolean(exact && exact.byteLength >= 5_000_000);
 }
 
 /**

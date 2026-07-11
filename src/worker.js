@@ -706,6 +706,34 @@ function onnxFileForDtype(dtype) {
 }
 
 /**
+ * List onnx/*.onnx filenames inside a resolved pack (for errors / probing).
+ * @param {string} modelId
+ */
+async function listPackOnnxFiles(modelId) {
+  const pack = await resolvePackDir(modelId);
+  if (!pack) return [];
+  /** @type {string[]} */
+  const names = [];
+  try {
+    const onnx = await pack.getDirectoryHandle("onnx");
+    for await (const [name, h] of onnx.entries()) {
+      if (h.kind === "file" && name.endsWith(".onnx")) {
+        try {
+          const f = await h.getFile();
+          const mb = (f.size / (1024 * 1024)).toFixed(1);
+          names.push(`${name} (${mb} MB)`);
+        } catch {
+          names.push(name);
+        }
+      }
+    }
+  } catch {
+    /* no onnx dir */
+  }
+  return names;
+}
+
+/**
  * Pick device + dtype from the user library only (no site/repo packs).
  */
 async function pickRuntime(preferWebGPU) {
@@ -727,61 +755,104 @@ async function pickRuntime(preferWebGPU) {
     return "wasm";
   };
 
-  // Probe library for wanted dtype, then q8 fallback on same / v1 pack
-  for (const [dtype, file] of [
+  /**
+   * Try to load a specific onnx file for a model id.
+   * @param {string} id
+   * @param {string} dtype
+   * @param {string} file
+   */
+  async function tryFile(id, dtype, file) {
+    const rel = `onnx/${file}`;
+    const buf = await readFromModelLibrary(id, rel);
+    if (!buf) return null;
+    // Exact filename match → only require a real multi‑MB file (not SPA HTML)
+    if (!weightSizeOk(dtype, buf.byteLength, { byName: true })) return null;
+    return buf;
+  }
+
+  // Probe wanted dtype first, then other common files in the pack
+  /** @type {[string, string][]} */
+  const candidates = [
     [wanted, onnxFileForDtype(wanted)],
     ["q8", "model_quantized.onnx"],
-  ]) {
-    if (dtype !== wanted && wanted === "q8") continue;
+    ["fp32", "model.onnx"],
+    ["q4", "model_q4.onnx"],
+  ];
+  // de-dupe by file name
+  const seenFiles = new Set();
+  const ordered = [];
+  for (const c of candidates) {
+    if (seenFiles.has(c[1])) continue;
+    seenFiles.add(c[1]);
+    ordered.push(c);
+  }
+
+  for (const [dtype, file] of ordered) {
+    // Prefer exact dtype first; only fall back to other files after
+    if (dtype !== wanted && ordered[0][0] === wanted) {
+      // still allow fallbacks after wanted exhausted — handled by loop order
+    }
     for (const id of [MODEL_ID, V1_MODEL_ID]) {
-      const buf = await readFromModelLibrary(id, `onnx/${file}`);
-      if (buf && weightSizeOk(dtype, buf.byteLength)) {
-        if (id !== MODEL_ID) {
-          MODEL_ID = id;
-          MODEL_BASE = new URL(
-            `models/${id}/`,
-            self.location.origin + BASE_URL,
-          ).pathname.replace(/\/?$/, "/");
-        }
-        return {
-          device: pickDevice(dtype),
-          dtype,
-          source:
-            dtype === wanted
-              ? `library-${dtype}`
-              : `library-q8-fallback-from-${wanted}`,
-        };
+      const buf = await tryFile(id, dtype, file);
+      if (!buf) continue;
+      // If this isn't the requested dtype, only accept as fallback after wanted failed
+      // (loop already tries wanted first)
+      if (id !== MODEL_ID) {
+        MODEL_ID = id;
+        MODEL_BASE = new URL(
+          `models/${id}/`,
+          self.location.origin + BASE_URL,
+        ).pathname.replace(/\/?$/, "/");
       }
+      return {
+        device: pickDevice(dtype),
+        dtype,
+        source:
+          dtype === wanted
+            ? `library-${dtype}`
+            : `library-${dtype}-fallback-from-${wanted}`,
+      };
     }
   }
 
+  const listed = await listPackOnnxFiles(MODEL_ID);
+  const have =
+    listed.length > 0
+      ? ` Found in pack: ${listed.join(", ")}.`
+      : " No onnx/*.onnx files found under your library for this pack.";
+  const need = onnxFileForDtype(wanted);
   throw new Error(
-    `No weights in your library for ${activeModel.shortLabel}. Download it first (saves under models/${MODEL_ID}/onnx/).`,
+    `No “${need}” for ${activeModel.shortLabel}.${have} Download “${activeModel.shortLabel}” (writes models/${MODEL_ID}/onnx/${need}), or load Balanced if you only have model_quantized.onnx.`,
   );
 }
 
 /**
- * Sanity-check ONNX file size for a dtype so we don't load the wrong blob
- * (e.g. a 90MB q8 file as "fp32", or a 310MB fp32 file as "q4").
+ * Size gate for ONNX blobs.
+ * When byName=true we already resolved the exact filename for that dtype,
+ * so only enforce a minimum size (HF q4 exports can be surprisingly large).
  * @param {string} dtype
  * @param {number} bytes
+ * @param {{ byName?: boolean }} [opts]
  */
-function weightSizeOk(dtype, bytes) {
+function weightSizeOk(dtype, bytes, opts = {}) {
   if (!Number.isFinite(bytes) || bytes < 1_000_000) return false;
   const mb = bytes / (1024 * 1024);
+  if (opts.byName) {
+    // Filename is authoritative — accept any real multi‑MB weight file
+    return mb >= 5 && mb <= 500;
+  }
   switch (dtype) {
     case "fp32":
-      // Full precision Kokoro ~300–330 MB
-      return mb >= 200 && mb <= 450;
+      return mb >= 180 && mb <= 450;
     case "fp16":
-      return mb >= 80 && mb <= 250;
+      return mb >= 80 && mb <= 280;
     case "q4":
     case "q4f16":
-      // True q4 is typically ~40–100 MB — reject huge mislabeled files
-      return mb >= 20 && mb <= 160;
+      // Community q4 can be ~50–300 MB depending on export
+      return mb >= 15 && mb <= 400;
     case "q8":
     default:
-      return mb >= 25 && mb <= 160;
+      return mb >= 20 && mb <= 200;
   }
 }
 
