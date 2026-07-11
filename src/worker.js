@@ -496,7 +496,7 @@ async function fetchVoiceBuffer(fileName) {
     }
 
     throw new Error(
-      `Voice "${fileName.replace(/\.bin$/, "")}" not in your library. Click “Download voices” under Voice, then Generate again.`,
+      `Voice "${fileName.replace(/\.bin$/, "")}" not in your library. Open the voice list and click ↓ next to that voice, then Generate again.`,
     );
   })();
 

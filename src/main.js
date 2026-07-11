@@ -81,6 +81,10 @@ const els = {
 
 /** @type {boolean} */
 let voicesDownloading = false;
+/** @type {string | null} */
+let voiceDownloadingId = null;
+/** @type {Map<string, boolean>} */
+const voiceOnDisk = new Map();
 
 /** @type {Worker | null} */
 let worker = null;
@@ -511,30 +515,103 @@ async function downloadModelToDisk(key) {
 }
 
 /**
- * Download English voice .bin files into the local library for the active model.
+ * Ensure library folder is ready for voice downloads.
+ * @returns {Promise<boolean>}
  */
-async function downloadVoicesForSelectedModel() {
-  if (voicesDownloading || modelDownloadingKey) {
-    setStatus("A download is already running.", "error");
-    return;
-  }
+async function ensureLibraryForVoices() {
   if (!modelLibDirHandle) {
     const details = document.getElementById("save-settings");
     if (details) details.open = true;
-    showSetupModal("Choose a model library folder first, then download voices.");
+    showSetupModal("Choose a model library folder first, then download a voice.");
     setStatus("Choose a model library folder under Storage first.", "error");
-    return;
+    return false;
   }
   if (!(await ensureDirPermission(modelLibDirHandle))) {
     setStatus("Folder permission needed to save voices.", "error");
+    return false;
+  }
+  return true;
+}
+
+function notifyWorkerVoicesUpdated() {
+  sendModelLibraryToWorker();
+  try {
+    worker?.postMessage({ type: "clear-voice-cache" });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Download a single voice .bin into the local library.
+ * @param {string} voiceId e.g. af_nicole
+ */
+async function downloadSingleVoice(voiceId) {
+  const id = String(voiceId || "").replace(/\.bin$/i, "");
+  if (!id) return;
+  if (voicesDownloading || voiceDownloadingId || modelDownloadingKey) {
+    setStatus("A download is already running.", "error");
     return;
   }
+  if (!(await ensureLibraryForVoices())) return;
+
+  const entry = getModelEntry(selectedModelKey);
+  voiceDownloadingId = id;
+  updateVoiceDownloadButtons();
+
+  const applyProgress = (ev) => {
+    const msg = ev.message || `Downloading ${id}…`;
+    setStatus(msg);
+    if (els.voiceDownloadProgress) {
+      els.voiceDownloadProgress.hidden = false;
+      els.voiceDownloadProgress.textContent = msg;
+    }
+  };
+
+  try {
+    await downloadVoicesToLibrary({
+      libraryRoot: modelLibDirHandle,
+      modelId: entry.modelId,
+      voiceIds: [id],
+      onProgress: applyProgress,
+    });
+    // Shared v1 voice path used by many loads
+    if (entry.modelId !== "onnx-community/Kokoro-82M-v1.0-ONNX") {
+      await downloadVoicesToLibrary({
+        libraryRoot: modelLibDirHandle,
+        modelId: "onnx-community/Kokoro-82M-v1.0-ONNX",
+        voiceIds: [id],
+        onProgress: applyProgress,
+      });
+    }
+    voiceOnDisk.set(id, true);
+    notifyWorkerVoicesUpdated();
+    setStatus(`Voice “${id}” saved to your library. Generate again.`, "success");
+  } catch (err) {
+    console.error(err);
+    setStatus(err?.message || `Failed to download voice ${id}.`, "error");
+  } finally {
+    voiceDownloadingId = null;
+    if (els.voiceDownloadProgress) els.voiceDownloadProgress.hidden = true;
+    updateVoiceDownloadButtons();
+  }
+}
+
+/**
+ * Download all English voice .bin files for the active model.
+ */
+async function downloadVoicesForSelectedModel() {
+  if (voicesDownloading || voiceDownloadingId || modelDownloadingKey) {
+    setStatus("A download is already running.", "error");
+    return;
+  }
+  if (!(await ensureLibraryForVoices())) return;
 
   const entry = getModelEntry(selectedModelKey);
   voicesDownloading = true;
+  updateVoiceDownloadButtons();
   if (els.downloadVoicesBtn) {
-    els.downloadVoicesBtn.disabled = true;
-    els.downloadVoicesBtn.textContent = "Downloading voices…";
+    els.downloadVoicesBtn.textContent = "Downloading all…";
   }
   if (els.voiceDownloadProgress) {
     els.voiceDownloadProgress.hidden = false;
@@ -560,7 +637,6 @@ async function downloadVoicesForSelectedModel() {
       voiceIds: ENGLISH_VOICES,
       onProgress: applyProgress,
     });
-    // Also mirror voices onto v1 id if different (shared style packs)
     if (entry.modelId !== "onnx-community/Kokoro-82M-v1.0-ONNX") {
       await downloadVoicesToLibrary({
         libraryRoot: modelLibDirHandle,
@@ -569,16 +645,11 @@ async function downloadVoicesForSelectedModel() {
         onProgress: applyProgress,
       });
     }
-    sendModelLibraryToWorker();
-    // Tell worker to drop cached voice misses
-    try {
-      worker?.postMessage({ type: "clear-voice-cache" });
-    } catch {
-      /* ignore */
-    }
+    for (const v of ENGLISH_VOICES) voiceOnDisk.set(v, true);
+    notifyWorkerVoicesUpdated();
     await refreshModelLibScan();
     setStatus(
-      `Voices ready for ${entry.shortLabel}: ${result.saved} new, ${result.skipped} already present. Try Generate again.`,
+      `All voices ready: ${result.saved} new, ${result.skipped} already present.`,
       "success",
     );
   } catch (err) {
@@ -587,13 +658,74 @@ async function downloadVoicesForSelectedModel() {
   } finally {
     voicesDownloading = false;
     if (els.downloadVoicesBtn) {
-      els.downloadVoicesBtn.disabled = false;
-      els.downloadVoicesBtn.textContent = "Download voices";
+      els.downloadVoicesBtn.textContent = "Download all voices";
     }
     if (els.voiceDownloadProgress) {
       els.voiceDownloadProgress.hidden = true;
     }
+    updateVoiceDownloadButtons();
   }
+}
+
+function updateVoiceDownloadButtons() {
+  const busy = voicesDownloading || voiceDownloadingId != null;
+  if (els.downloadVoicesBtn) {
+    els.downloadVoicesBtn.disabled = busy;
+    if (!voicesDownloading) {
+      els.downloadVoicesBtn.textContent = "Download all voices";
+    }
+  }
+  els.voiceMenu?.querySelectorAll(".voice-download-one").forEach((btn) => {
+    const id = btn.dataset.voice;
+    const onDisk = voiceOnDisk.get(id) === true;
+    const thisBusy = voiceDownloadingId === id;
+    btn.hidden = onDisk;
+    btn.disabled = busy;
+    btn.textContent = thisBusy ? "…" : "↓";
+    btn.title = thisBusy
+      ? `Downloading ${id}…`
+      : onDisk
+        ? `${id} on disk`
+        : `Download voice ${id}`;
+  });
+  els.voiceMenu?.querySelectorAll(".voice-option").forEach((btn) => {
+    const id = btn.dataset.value;
+    const badge = btn.querySelector(".voice-dl-badge");
+    if (!badge || !id) return;
+    const onDisk = voiceOnDisk.get(id) === true;
+    badge.textContent = onDisk ? "✓" : "☁";
+    badge.classList.toggle("is-local", onDisk);
+    badge.classList.toggle("is-remote", !onDisk);
+    badge.title = onDisk ? "Voice on disk" : "Voice not downloaded";
+  });
+}
+
+async function refreshVoiceOnDiskStatus() {
+  if (!modelLibDirHandle || !(await ensureDirPermission(modelLibDirHandle))) {
+    voiceOnDisk.clear();
+    updateVoiceDownloadButtons();
+    return;
+  }
+  const entry = getModelEntry(selectedModelKey);
+  const { readLibraryModelFile } = await import("./modelLibrary.js");
+  const ids = voiceOptions.length
+    ? voiceOptions.map((v) => v.value)
+    : ENGLISH_VOICES;
+  await Promise.all(
+    ids.map(async (id) => {
+      try {
+        const buf = await readLibraryModelFile(
+          modelLibDirHandle,
+          entry.modelId,
+          `voices/${id}.bin`,
+        );
+        voiceOnDisk.set(id, Boolean(buf && buf.byteLength > 1000));
+      } catch {
+        voiceOnDisk.set(id, false);
+      }
+    }),
+  );
+  updateVoiceDownloadButtons();
 }
 
 /**
@@ -980,6 +1112,7 @@ function openVoiceMenu() {
     voiceOptions.findIndex((v) => v.value === selectedVoice),
   );
   setVoiceActiveIndex(idx);
+  refreshVoiceOnDiskStatus().catch(() => {});
 }
 
 function toggleVoiceMenu() {
@@ -1042,6 +1175,9 @@ function populateVoices(voices) {
       const fullLabel = voiceLabel(id, meta);
       voiceOptions.push({ value: id, label: fullLabel, group: lang });
 
+      const row = document.createElement("div");
+      row.className = "voice-option-row";
+
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "voice-option";
@@ -1049,6 +1185,11 @@ function populateVoices(voices) {
       btn.dataset.value = id;
       btn.dataset.index = String(voiceOptions.length - 1);
       btn.setAttribute("aria-selected", "false");
+
+      const badge = document.createElement("span");
+      badge.className = "voice-dl-badge model-dl-badge is-remote";
+      badge.textContent = "☁";
+      badge.title = "Voice not downloaded";
 
       const name = document.createElement("span");
       name.className = "voice-option-name";
@@ -1058,12 +1199,29 @@ function populateVoices(voices) {
       metaEl.className = "voice-option-meta";
       metaEl.textContent = shortVoiceMeta(meta) || id;
 
-      btn.append(name, metaEl);
+      btn.append(badge, name, metaEl);
       btn.addEventListener("click", () => setSelectedVoice(id));
       btn.addEventListener("mousemove", () => {
         setVoiceActiveIndex(Number(btn.dataset.index));
       });
-      els.voiceMenu.appendChild(btn);
+
+      const dlOne = document.createElement("button");
+      dlOne.type = "button";
+      dlOne.className = "btn btn-secondary btn-sm voice-download-one";
+      dlOne.dataset.voice = id;
+      dlOne.textContent = "↓";
+      dlOne.title = `Download voice ${id}`;
+      dlOne.setAttribute("aria-label", `Download voice ${id}`);
+      dlOne.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        downloadSingleVoice(id).catch((err) =>
+          setStatus(err?.message || "Voice download failed.", "error"),
+        );
+      });
+
+      row.append(btn, dlOne);
+      els.voiceMenu.appendChild(row);
     }
   }
 
@@ -1073,6 +1231,7 @@ function populateVoices(voices) {
     "af_heart";
   setSelectedVoice(initial, { close: true });
   els.voiceTrigger.disabled = !ready || generating;
+  refreshVoiceOnDiskStatus().catch(() => {});
 }
 
 /* ── IndexedDB helpers for directory handle ───────────────────────── */
