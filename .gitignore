@@ -3,10 +3,3 @@ dist
 .DS_Store
 *.log
 .vite
-
-# Keep huge ONNX variants local-only (need Git LFS + lots of bandwidth).
-# Default q8 (model_quantized.onnx) + voices ARE committed for Pages.
-public/models/**/model.onnx
-public/models/**/model_q4.onnx
-public/models/**/model_fp16.onnx
-public/models/**/model_q4f16.onnx

@@ -17,6 +17,7 @@ import {
   isGithubSaveReady,
   loadGithubModelsConfig,
   saveGithubModelsConfig,
+  triggerAddModelWorkflow,
   uploadModelFilesToRepo,
 } from "./githubRepoModels.js";
 
@@ -378,6 +379,7 @@ async function refreshModelDownloadStatus() {
 
 /**
  * Download a catalog model into the user library folder and/or GitHub repo.
+ * When GitHub save is ready, starts an Action that commits the model into the repo.
  * @param {string} key
  */
 async function downloadModelToDisk(key) {
@@ -388,8 +390,18 @@ async function downloadModelToDisk(key) {
   }
 
   persistGithubModelsForm();
-  const ghConfig = loadGithubModelsConfig();
-  const wantGithub = isGithubSaveReady(ghConfig);
+  let ghConfig = loadGithubModelsConfig();
+  let wantGithub = isGithubSaveReady(ghConfig);
+
+  // GitHub save enabled but missing token — open Storage and stop
+  if (ghConfig.enabled && !wantGithub) {
+    openGithubSettingsForToken();
+    setStatus(
+      "Paste a GitHub token (repo + workflow) under Storage, then click Download again — the model will be saved to the repo.",
+      "error",
+    );
+    return;
+  }
 
   // Skip only when already available and we are not pushing to GitHub
   if (modelDownloadStatus.get(entry.key) && !wantGithub) {
@@ -397,11 +409,11 @@ async function downloadModelToDisk(key) {
     return;
   }
 
-  // Prefer user library folder; optional if GitHub save is configured
+  // Local library optional if GitHub save will handle the repo
   if (!modelLibDirHandle && !wantGithub) {
     if (!supportsDirPicker) {
       setStatus(
-        "Pick a model library folder (Chrome/Edge), or enable Save downloads to GitHub with a token.",
+        "Enable Save downloads to GitHub (Storage) and paste a token, or use Chrome/Edge to pick a folder.",
         "error",
       );
       return;
@@ -412,14 +424,6 @@ async function downloadModelToDisk(key) {
 
   if (modelLibDirHandle && !(await ensureDirPermission(modelLibDirHandle))) {
     setStatus("Permission needed to write models into your library folder.", "error");
-    return;
-  }
-
-  if (ghConfig.enabled && !wantGithub) {
-    setStatus(
-      "GitHub save is on but token/owner/repo is incomplete. Fill Storage → GitHub fields.",
-      "error",
-    );
     return;
   }
 
@@ -460,30 +464,66 @@ async function downloadModelToDisk(key) {
   };
 
   try {
-    const files = await downloadEntryFiles({
-      modelKey: entry.key,
-      libraryRoot: modelLibDirHandle || null,
-      returnBuffers: wantGithub,
-      onProgress: applyProgress,
-    });
-
     let githubResult = null;
+
+    // Primary path: GitHub Action downloads + commits into the repo
     if (wantGithub) {
-      githubResult = await uploadModelFilesToRepo({
-        config: ghConfig,
+      try {
+        githubResult = await triggerAddModelWorkflow(
+          ghConfig,
+          entry.key,
+          applyProgress,
+        );
+      } catch (wfErr) {
+        console.warn("Workflow dispatch failed, trying direct upload:", wfErr);
+        // Fallback: browser fetch + Git Data API (files under ~100MB)
+        const files = await downloadEntryFiles({
+          modelKey: entry.key,
+          libraryRoot: modelLibDirHandle || null,
+          returnBuffers: true,
+          onProgress: applyProgress,
+        });
+        githubResult = await uploadModelFilesToRepo({
+          config: ghConfig,
+          modelKey: entry.key,
+          files,
+          onProgress: applyProgress,
+        });
+        if (modelLibDirHandle) sendModelLibraryToWorker();
+      }
+    }
+
+    // Optional: also keep a local library copy when only folder was requested
+    // or when workflow path skipped local write
+    if (modelLibDirHandle && !githubResult?.mode) {
+      // already written in fallback above
+    } else if (modelLibDirHandle && githubResult?.mode === "workflow") {
+      // Still download to local folder for offline use
+      await downloadEntryFiles({
         modelKey: entry.key,
-        files,
+        libraryRoot: modelLibDirHandle,
+        returnBuffers: false,
         onProgress: applyProgress,
       });
+      sendModelLibraryToWorker();
+    } else if (!wantGithub && modelLibDirHandle) {
+      await downloadEntryFiles({
+        modelKey: entry.key,
+        libraryRoot: modelLibDirHandle,
+        returnBuffers: false,
+        onProgress: applyProgress,
+      });
+      sendModelLibraryToWorker();
     }
 
     modelDownloadStatus.set(entry.key, true);
     await refreshModelDownloadStatus();
-    if (modelLibDirHandle) sendModelLibraryToWorker();
 
     const parts = [];
     if (modelLibDirHandle) parts.push(`folder “${modelLibDirHandle.name}”`);
-    if (githubResult) {
+    if (githubResult?.mode === "workflow") {
+      parts.push(`GitHub Action (repo ${ghConfig.owner}/${ghConfig.repo})`);
+    } else if (githubResult?.uploaded) {
       parts.push(
         `GitHub (${githubResult.uploaded.length} files${
           githubResult.skipped?.length
@@ -493,8 +533,10 @@ async function downloadModelToDisk(key) {
       );
     }
     setStatus(
-      `${entry.shortLabel} saved to ${parts.join(" and ")}.${
-        githubResult ? " Pages will redeploy shortly." : " Select it to load."
+      `${entry.shortLabel} → ${parts.join(" and ") || "saved"}.${
+        githubResult
+          ? " Check Actions; Pages will redeploy when the model commit lands."
+          : " Select it to load."
       }`,
       "success",
     );
@@ -515,12 +557,33 @@ async function downloadModelToDisk(key) {
         setStatus(err?.message || e2?.message || "Download failed.", "error");
       }
     } else {
-      setStatus(err?.message || "Download failed.", "error");
+      const msg = err?.message || "Download failed.";
+      if (/workflow|Resource not accessible|403|401/i.test(msg)) {
+        setStatus(
+          `${msg} — Token needs repo + workflow scopes. Create one at github.com/settings/tokens`,
+          "error",
+        );
+      } else {
+        setStatus(msg, "error");
+      }
     }
   } finally {
     modelDownloadingKey = null;
     updateModelDownloadIcons();
   }
+}
+
+function openGithubSettingsForToken() {
+  const details = document.getElementById("save-settings");
+  if (details) details.open = true;
+  if (els.githubSaveEnabled) {
+    els.githubSaveEnabled.checked = true;
+    persistGithubModelsForm();
+  }
+  if (els.githubModelsFields) els.githubModelsFields.hidden = false;
+  loadGithubModelsForm();
+  els.githubToken?.focus();
+  els.githubToken?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function loadGithubModelsForm() {
@@ -552,15 +615,15 @@ function updateGithubModelsHint(cfg = loadGithubModelsConfig()) {
   if (!els.githubModelsHint) return;
   if (!cfg.enabled) {
     els.githubModelsHint.textContent =
-      "When enabled, Download commits model files to public/models/ on your repo (Pages redeploys).";
+      "When enabled, Download saves the model into your GitHub repo (Action downloads + commits public/models/).";
     return;
   }
   if (!cfg.token) {
     els.githubModelsHint.textContent =
-      "Add a GitHub token with Contents write access on this repo. Stored only in this browser.";
+      "Required once: classic PAT with repo + workflow scopes (or fine-grained Actions + Contents write). Stored only in this browser.";
     return;
   }
-  els.githubModelsHint.textContent = `Ready → https://github.com/${cfg.owner}/${cfg.repo} (branch ${cfg.branch}). Max ~100 MB per file via API.`;
+  els.githubModelsHint.textContent = `Ready → Download starts Action on https://github.com/${cfg.owner}/${cfg.repo} (branch ${cfg.branch}) to commit models.`;
 }
 
 /**

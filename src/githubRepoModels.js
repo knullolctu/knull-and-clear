@@ -39,11 +39,86 @@ export function loadGithubModelsConfig() {
 /** @returns {GithubModelsConfig} */
 function defaultConfig() {
   return {
-    enabled: false,
+    // On by default: Download commits models to the GitHub repo (needs a token once).
+    enabled: true,
     owner: "knullolctu",
     repo: "knull-and-clear",
     branch: "master",
     token: "",
+  };
+}
+
+/**
+ * Trigger the "Add model to repo" GitHub Action.
+ * CI downloads from Hugging Face and commits under public/models/ (no big browser upload).
+ *
+ * Token needs classic scopes: `repo` + `workflow` (or fine-grained: Actions write + Contents write).
+ *
+ * @param {GithubModelsConfig} config
+ * @param {string} modelKey
+ * @param {(ev: object) => void} [onProgress]
+ */
+export async function triggerAddModelWorkflow(config, modelKey, onProgress) {
+  if (!isGithubSaveReady(config)) {
+    throw new Error(
+      "Enable “Save downloads to GitHub” and paste a GitHub token first.",
+    );
+  }
+  const entry = getModelEntry(modelKey);
+  const { owner, repo, branch } = config;
+
+  onProgress?.({
+    type: "start",
+    message: `Starting GitHub Action to save ${entry.shortLabel} into ${owner}/${repo}…`,
+  });
+
+  // Prefer workflow file path; fall back to workflow id lookup if needed.
+  const dispatchPath = `/repos/${owner}/${repo}/actions/workflows/add-model.yml/dispatches`;
+  try {
+    await ghApi(config, dispatchPath, {
+      method: "POST",
+      body: JSON.stringify({
+        ref: branch,
+        inputs: { model_key: modelKey },
+      }),
+    });
+  } catch (err) {
+    // 404 sometimes means wrong path — try listing workflows
+    if (err?.status === 404) {
+      const list = await ghApi(config, `/repos/${owner}/${repo}/actions/workflows`);
+      const wf = (list.workflows || []).find(
+        (w) =>
+          w.path?.endsWith("add-model.yml") ||
+          w.name === "Add model to repo",
+      );
+      if (!wf) throw err;
+      await ghApi(
+        config,
+        `/repos/${owner}/${repo}/actions/workflows/${wf.id}/dispatches`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ref: branch,
+            inputs: { model_key: modelKey },
+          }),
+        },
+      );
+    } else {
+      throw err;
+    }
+  }
+
+  const actionsUrl = `https://github.com/${owner}/${repo}/actions/workflows/add-model.yml`;
+  onProgress?.({
+    type: "complete",
+    message: `GitHub Action started — it will commit ${entry.shortLabel} to the repo, then Pages redeploys.`,
+  });
+
+  return {
+    mode: "workflow",
+    modelKey,
+    actionsUrl,
+    htmlUrl: actionsUrl,
   };
 }
 

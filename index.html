@@ -219,10 +219,10 @@
               </div>
               <div class="control github-models-control">
                 <label class="check-card" for="github-save-enabled">
-                  <input id="github-save-enabled" type="checkbox" />
+                  <input id="github-save-enabled" type="checkbox" checked />
                   <span>
                     <strong>Save downloads to GitHub repo</strong>
-                    <small>Commit model files under public/models/ so Pages can host them</small>
+                    <small>Download runs a GitHub Action that commits the model under public/models/</small>
                   </span>
                 </label>
                 <div class="github-models-fields" id="github-models-fields" hidden>
@@ -273,9 +273,9 @@
                     </div>
                   </div>
                   <p class="hint" id="github-models-hint">
-                    Paste a fine-grained token with Contents read/write on this repo (or classic
-                    <code>repo</code> scope). Token stays in this browser only. Files over ~100&nbsp;MB
-                    cannot be uploaded via the API.
+                    Paste a classic token with <code>repo</code> + <code>workflow</code> scopes
+                    (or fine-grained: Actions write + Contents write). Stored only in this browser.
+                    Then every Download saves that model into the repo.
                   </p>
                 </div>
               </div>

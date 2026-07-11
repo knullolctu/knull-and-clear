@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "download-model": "node scripts/download-model.mjs",
     "download-model:fp32": "node scripts/download-model.mjs --fp32",
-    "download-model:english": "node scripts/download-model.mjs --english-only-voices"
+    "download-model:english": "node scripts/download-model.mjs --english-only-voices",
+    "download-model:key": "node scripts/download-model-for-key.mjs"
   },
   "dependencies": {
     "kokoro-js": "^1.2.1"
