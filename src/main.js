@@ -2075,9 +2075,13 @@ async function main() {
     }
   } else {
     hideSetupModal();
-    enterSetupMode(
-      `Models save to “${modelLibDirHandle.name}”. Download if needed, then select a model to load.`,
+    // Same path as picking a model: load tokenizer + weights from library
+    const key = selectedModelKey || DEFAULT_MODEL_KEY;
+    const entry = getModelEntry(key);
+    setStatus(
+      `Restoring “${entry.shortLabel}” from “${modelLibDirHandle.name}”…`,
     );
+    await setSelectedModel(key, { load: true });
   }
 }
 
