@@ -52,8 +52,8 @@
           (for example a folder named <code>knull-models</code>).
         </p>
         <ul class="setup-modal-list">
-          <li>Models stay offline in the folder you choose</li>
-          <li>You can change it later under Storage</li>
+          <li>Models save as <code>{folder}/models/…</code> on your PC</li>
+          <li>You can change the folder later under Storage</li>
           <li>Chrome or Edge recommended (folder access API)</li>
         </ul>
         <button id="setup-choose-folder-btn" class="btn btn-primary setup-modal-btn" type="button">
@@ -273,19 +273,8 @@
                     Clear
                   </button>
                 </div>
-                <div class="settings-grid model-lib-layout-grid">
-                  <div class="control">
-                    <label class="field-label" for="model-lib-layout">Folder layout</label>
-                    <select id="model-lib-layout" class="text-input text-input-sm">
-                      <option value="auto">Auto-detect</option>
-                      <option value="nested">Nested · {folder}/{model-id}/onnx/…</option>
-                      <option value="flat">Flat · this folder is one pack (onnx/ + config)</option>
-                      <option value="public-models">public/models · onnx-community/…</option>
-                    </select>
-                  </div>
-                </div>
                 <p class="hint" id="model-lib-hint">
-                  Chrome / Edge: pick where weights live. Runtime is offline-only (no Hugging Face loads).
+                  Fixed layout: <code>{folder}/models/{model-id}/onnx/…</code> · offline only.
                 </p>
                 <p class="hint model-lib-scan" id="model-lib-scan" hidden></p>
               </div>

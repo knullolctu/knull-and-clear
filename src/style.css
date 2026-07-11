@@ -920,13 +920,11 @@ button.linkish:hover {
   gap: 0.55rem;
 }
 
-.model-lib-layout-grid {
-  margin-top: 0.55rem;
-}
-
-.model-lib-layout-grid select {
-  width: 100%;
-  cursor: pointer;
+.model-lib-hint code,
+.model-lib-control .hint code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  color: var(--accent-2);
 }
 
 .model-lib-scan {

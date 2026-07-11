@@ -51,12 +51,9 @@ function configureOrtWasm() {
 
 /** @type {FileSystemDirectoryHandle | null} */
 let modelLibraryRoot = null;
-/** @type {"auto"|"nested"|"flat"|"public-models"} */
-let modelLibraryLayout = "auto";
-/** Resolved after first read when layout is auto */
-let modelLibraryLayoutResolved = null;
 
 /**
+ * Fixed library layout: {root}/models/{modelId}/{fileRel}
  * @param {string} relativePath path under library root
  */
 async function readLibraryAbsolute(relativePath) {
@@ -77,103 +74,31 @@ async function readLibraryAbsolute(relativePath) {
 }
 
 /**
- * Probe which layout the library uses (cached).
- */
-async function getResolvedLibraryLayout() {
-  if (!modelLibraryRoot) return "nested";
-  if (modelLibraryLayout !== "auto") return modelLibraryLayout;
-  if (modelLibraryLayoutResolved) return modelLibraryLayoutResolved;
-
-  // Flat pack?
-  try {
-    await modelLibraryRoot.getFileHandle("config.json");
-    const onnx = await modelLibraryRoot.getDirectoryHandle("onnx");
-    let hasOnnx = false;
-    for await (const [name, h] of onnx.entries()) {
-      if (h.kind === "file" && name.endsWith(".onnx")) {
-        hasOnnx = true;
-        break;
-      }
-    }
-    if (hasOnnx) {
-      modelLibraryLayoutResolved = "flat";
-      return "flat";
-    }
-  } catch {
-    /* not flat */
-  }
-
-  // public-models?
-  try {
-    await modelLibraryRoot.getDirectoryHandle("onnx-community");
-    modelLibraryLayoutResolved = "public-models";
-    return "public-models";
-  } catch {
-    /* nested default */
-  }
-
-  modelLibraryLayoutResolved = "nested";
-  return "nested";
-}
-
-/**
- * Read a model file from the user library using layout-aware candidates.
+ * Read a model file from the user library (always under models/).
  * @param {string} modelId e.g. onnx-community/Kokoro-82M-v1.0-ONNX
  * @param {string} fileRel e.g. onnx/model_quantized.onnx or voices/af_heart.bin
  */
 async function readFromModelLibrary(modelId, fileRel) {
   if (!modelLibraryRoot) return null;
-  const layout = await getResolvedLibraryLayout();
   const file = String(fileRel || "").replace(/^\/+/, "");
-  /** @type {string[]} */
-  const candidates = [];
-
-  if (layout === "flat") {
-    candidates.push(file);
-  } else {
-    candidates.push(`${modelId}/${file}`);
-    // If user nested only the last segment
-    const short = modelId.split("/").pop();
-    if (short) candidates.push(`${short}/${file}`);
-  }
-  // Always try alternate layouts as fallback
-  candidates.push(file);
-  candidates.push(`${modelId}/${file}`);
-
-  const seen = new Set();
-  for (const rel of candidates) {
-    if (!rel || seen.has(rel)) continue;
-    seen.add(rel);
-    const buf = await readLibraryAbsolute(rel);
-    if (buf) return buf;
-  }
-  return null;
+  const rel = `models/${modelId}/${file}`.replace(/\/+/g, "/");
+  return readLibraryAbsolute(rel);
 }
 
 /**
- * Back-compat: path like onnx-community/…/onnx/file.onnx
- * @param {string} fullRel
+ * Path from site URL /models/{modelId}/… → library models/{modelId}/…
+ * @param {string} fullRel e.g. onnx-community/…/onnx/file.onnx
  */
 async function readFromModelLibraryPath(fullRel) {
   if (!modelLibraryRoot || !fullRel) return null;
-  const parts = fullRel.split("/").filter(Boolean);
-  // voices or onnx near the end → split modelId / file
-  const onnxIdx = parts.indexOf("onnx");
-  const voicesIdx = parts.indexOf("voices");
-  const cut = onnxIdx >= 0 ? onnxIdx : voicesIdx >= 0 ? voicesIdx : -1;
-  if (cut > 0) {
-    const modelId = parts.slice(0, cut).join("/");
-    const fileRel = parts.slice(cut).join("/");
-    return readFromModelLibrary(modelId, fileRel);
-  }
-  // config.json etc.
-  if (parts.length >= 2 && parts[parts.length - 1].includes(".")) {
-    const fileRel = parts[parts.length - 1];
-    const modelId = parts.slice(0, -1).join("/");
-    const buf = await readFromModelLibrary(modelId, fileRel);
-    if (buf) return buf;
-  }
-  return readLibraryAbsolute(fullRel);
+  const cleaned = String(fullRel).replace(/^\/+/, "");
+  // Prefer fixed prefix models/
+  let buf = await readLibraryAbsolute(
+    cleaned.startsWith("models/") ? cleaned : `models/${cleaned}`,
+  );
+  if (buf) return buf;
+  // Also try as models/{modelId}/{file} if path already includes model id
+  return null;
 }
 
 function libraryResponse(buf, contentType = "application/octet-stream") {
@@ -986,8 +911,6 @@ self.addEventListener("message", async (event) => {
 
   if (data.type === "set-model-library") {
     modelLibraryRoot = data.handle || null;
-    modelLibraryLayout = data.layout || "auto";
-    modelLibraryLayoutResolved = null;
     return;
   }
 
