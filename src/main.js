@@ -822,7 +822,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = false;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        `Models + voices: “${modelLibDirHandle.name}/models/onnx-community/Kokoro-…/” (onnx/, voices/, tokenizer).`;
+        `ONNX: “${modelLibDirHandle.name}/models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/” · voices: …/voices/`;
     }
   } else {
     els.modelLibLabel.textContent = "Not set — pick a folder for /models";
@@ -831,7 +831,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = true;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Chrome / Edge: pick a root folder. Layout: {folder}/models/onnx-community/Kokoro-82M-v1.0-ONNX/{onnx,voices,*.json}";
+        "Chrome / Edge: pick a root folder. Weights path: models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/";
     }
     if (els.modelLibScan) {
       els.modelLibScan.hidden = true;

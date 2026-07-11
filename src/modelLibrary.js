@@ -33,7 +33,21 @@ const MAX_SCAN_DEPTH = 8;
  */
 export function pathInLibrary(modelId, fileRel) {
   const file = String(fileRel || "").replace(/^\/+/, "");
+  // Always: models/onnx-community/Kokoro-…/onnx|voices|*.json
   return `${LIBRARY_MODELS_PREFIX}/${modelId}/${file}`.replace(/\/+/g, "/");
+}
+
+/**
+ * ONNX weights path:
+ *   models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/{file}
+ * @param {string} modelId
+ * @param {string} onnxFile e.g. model_quantized.onnx or onnx/model.onnx
+ */
+export function pathOnnxInLibrary(modelId, onnxFile) {
+  const file = String(onnxFile || "")
+    .replace(/^\/+/, "")
+    .replace(/^onnx\//, "");
+  return pathInLibrary(modelId, `onnx/${file}`);
 }
 
 /**
@@ -327,13 +341,14 @@ export async function listLibraryModelIds(root) {
  */
 export async function isEntryInLibrary(root, entry) {
   const onnx = onnxFileForDtype(entry.dtype);
-  // Ready only if weights AND tokenizer/config exist (can actually load)
+  // Weights must be under models/{modelId}/onnx/{file}
   const exact = await readLibraryModelFile(
     root,
     entry.modelId,
     `onnx/${onnx}`,
   );
   if (!exact || exact.byteLength < 5_000_000) return false;
+  // Sidecars next to onnx/ (same pack as voices/)
   const tok = await readLibraryModelFile(root, entry.modelId, "tokenizer.json");
   const cfg = await readLibraryModelFile(root, entry.modelId, "config.json");
   return Boolean(tok && tok.byteLength > 0 && cfg && cfg.byteLength > 0);

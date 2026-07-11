@@ -186,13 +186,63 @@ function packMatchScore(packPath, packName, modelId) {
  * @returns {Promise<FileSystemDirectoryHandle | null>}
  */
 /**
- * Canonical pack path (same layout voices use):
+ * Canonical pack path (models + voices share this root):
  *   {library}/models/onnx-community/Kokoro-82M-v1.0-ONNX/
+ * Weights always live under:
+ *   {library}/models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/
  * @param {string} modelId
  */
 function canonicalPackRel(modelId) {
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
   return `models/${id}`.replace(/\/+/g, "/");
+}
+
+/**
+ * Canonical ONNX weights path (what the user expects):
+ *   models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/{file}
+ * @param {string} modelId
+ * @param {string} onnxFile e.g. model_quantized.onnx
+ */
+function canonicalOnnxRel(modelId, onnxFile) {
+  const file = String(onnxFile || "")
+    .replace(/^\/+/, "")
+    .replace(/^onnx\//, "");
+  return `${canonicalPackRel(modelId)}/onnx/${file}`.replace(/\/+/g, "/");
+}
+
+/**
+ * Read an ONNX weight strictly from models/{modelId}/onnx/{file} first.
+ * @param {string} modelId
+ * @param {string} onnxFile
+ */
+async function readOnnxWeight(modelId, onnxFile) {
+  if (!modelLibraryRoot) return null;
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const file = String(onnxFile || "")
+    .replace(/^\/+/, "")
+    .replace(/^onnx\//, "");
+
+  // 1) Exact path: models/onnx-community/Kokoro-…/onnx/model_*.onnx
+  {
+    const buf = await readLibraryAbsolute(canonicalOnnxRel(id, file));
+    if (buf) return buf;
+  }
+
+  // 2) Library root already is models/
+  if ((modelLibraryRoot.name || "").toLowerCase() === "models") {
+    const buf = await readLibraryAbsolute(`${id}/onnx/${file}`);
+    if (buf) return buf;
+  }
+
+  // 3) Via pack dir → onnx/
+  const pack = await resolvePackDir(id);
+  if (pack) {
+    const buf = await readFromPack(pack, `onnx/${file}`);
+    if (buf) return buf;
+  }
+
+  // 4) Nested read helper
+  return readFromModelLibrary(id, `onnx/${file}`);
 }
 
 async function resolvePackDir(modelId) {
@@ -771,21 +821,20 @@ async function pickRuntime(preferWebGPU) {
   };
 
   /**
-   * Try to load a specific onnx file for a model id.
+   * Load weight from models/{id}/onnx/{file} only.
    * @param {string} id
    * @param {string} dtype
    * @param {string} file
    */
   async function tryFile(id, dtype, file) {
-    const rel = `onnx/${file}`;
-    const buf = await readFromModelLibrary(id, rel);
+    const buf = await readOnnxWeight(id, file);
     if (!buf) return null;
-    // Exact filename match → only require a real multi‑MB file (not SPA HTML)
     if (!weightSizeOk(dtype, buf.byteLength, { byName: true })) return null;
     return buf;
   }
 
-  // Probe wanted dtype first, then other common files in the pack
+  // Always probe the v1 pack path the user uses for voices:
+  // models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/
   /** @type {[string, string][]} */
   const candidates = [
     [wanted, onnxFileForDtype(wanted)],
@@ -793,7 +842,6 @@ async function pickRuntime(preferWebGPU) {
     ["fp32", "model.onnx"],
     ["q4", "model_q4.onnx"],
   ];
-  // de-dupe by file name
   const seenFiles = new Set();
   const ordered = [];
   for (const c of candidates) {
@@ -802,16 +850,13 @@ async function pickRuntime(preferWebGPU) {
     ordered.push(c);
   }
 
+  // Prefer catalog model id, then shared v1 pack (same as voices)
+  const ids = [...new Set([MODEL_ID, V1_MODEL_ID])];
+
   for (const [dtype, file] of ordered) {
-    // Prefer exact dtype first; only fall back to other files after
-    if (dtype !== wanted && ordered[0][0] === wanted) {
-      // still allow fallbacks after wanted exhausted — handled by loop order
-    }
-    for (const id of [MODEL_ID, V1_MODEL_ID]) {
+    for (const id of ids) {
       const buf = await tryFile(id, dtype, file);
       if (!buf) continue;
-      // If this isn't the requested dtype, only accept as fallback after wanted failed
-      // (loop already tries wanted first)
       if (id !== MODEL_ID) {
         MODEL_ID = id;
         MODEL_BASE = new URL(
@@ -824,20 +869,23 @@ async function pickRuntime(preferWebGPU) {
         dtype,
         source:
           dtype === wanted
-            ? `library-${dtype}`
-            : `library-${dtype}-fallback-from-${wanted}`,
+            ? `library-onnx/${file}`
+            : `library-onnx/${file}-fallback-from-${wanted}`,
       };
     }
   }
 
-  const listed = await listPackOnnxFiles(MODEL_ID);
+  const listed = await listPackOnnxFiles(V1_MODEL_ID);
+  const listedAlt =
+    MODEL_ID !== V1_MODEL_ID ? await listPackOnnxFiles(MODEL_ID) : [];
+  const allListed = [...new Set([...listed, ...listedAlt])];
   const have =
-    listed.length > 0
-      ? ` Found in pack: ${listed.join(", ")}.`
-      : " No onnx/*.onnx files found under your library for this pack.";
+    allListed.length > 0
+      ? ` Found under models/…/onnx/: ${allListed.join(", ")}.`
+      : ` No files under models/${MODEL_ID}/onnx/.`;
   const need = onnxFileForDtype(wanted);
   throw new Error(
-    `No “${need}” for ${activeModel.shortLabel}.${have} Download “${activeModel.shortLabel}” (writes models/${MODEL_ID}/onnx/${need}), or load Balanced if you only have model_quantized.onnx.`,
+    `No “${need}” in models/${MODEL_ID}/onnx/.${have} Put weights at models/onnx-community/Kokoro-82M-v1.0-ONNX/onnx/${need} (or Download “${activeModel.shortLabel}”).`,
   );
 }
 
