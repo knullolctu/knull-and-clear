@@ -17,8 +17,14 @@
       <div class="bg-grid"></div>
     </div>
 
-    <!-- Loading overlay -->
-    <div id="loading-overlay" class="loading-overlay" role="status" aria-live="polite">
+    <!-- Loading overlay: only shown when user explicitly loads a local model -->
+    <div
+      id="loading-overlay"
+      class="loading-overlay is-hidden"
+      role="status"
+      aria-live="polite"
+      hidden
+    >
       <div class="loading-card">
         <div class="loading-logo" aria-hidden="true">
           <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -41,8 +47,8 @@
         <div class="waveform" aria-hidden="true">
           <span></span><span></span><span></span><span></span><span></span>
         </div>
-        <h2 class="loading-title">Tuning Knull &amp; Clear</h2>
-        <p id="loading-message" class="loading-message">Clearing the silence…</p>
+        <h2 class="loading-title">Loading local model</h2>
+        <p id="loading-message" class="loading-message">Reading weights from your folder…</p>
         <div class="progress-track">
           <div id="progress-bar" class="progress-bar" style="width: 0%"></div>
         </div>

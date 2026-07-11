@@ -162,15 +162,35 @@ function setGenerating(isGenerating) {
 }
 
 function hideOverlay() {
+  if (!els.overlay) return;
   els.overlay.classList.add("is-hidden");
+  els.overlay.hidden = true;
 }
 
-function showOverlay(message = "Loading model…") {
+function showOverlay(message = "Loading local model…") {
+  if (!els.overlay) return;
+  els.overlay.hidden = false;
   els.overlay.classList.remove("is-hidden");
   els.loadingMessage.textContent = message;
   els.progressBar.style.width = "0%";
   els.progressDetail.textContent = "0%";
   els.progressBar.style.width = "8%";
+}
+
+/** Idle UI: no model loaded yet — user must set library first. */
+function enterSetupMode(message) {
+  ready = false;
+  modelSwitchPending = false;
+  hideOverlay();
+  if (els.generateBtn) els.generateBtn.disabled = true;
+  if (els.voiceTrigger) els.voiceTrigger.disabled = true;
+  // Model picker stays enabled so Download / select works
+  if (els.modelTrigger) els.modelTrigger.disabled = false;
+  if (els.deviceBadge) els.deviceBadge.textContent = "device: — · no model loaded";
+  setStatus(
+    message ||
+      "Set Storage → Model library folder first, then Download a model and select it to load.",
+  );
 }
 
 function escapeHtml(value) {
@@ -568,8 +588,8 @@ async function downloadModelToDisk(key) {
       `${entry.shortLabel} → ${parts.join(" and ") || "saved"}.${
         githubResult
           ? " Check Actions; Pages will redeploy when the model commit lands."
-          : " Select it to load."
-      }`,
+          : ""
+      } Select the model in the list to load it from your folder (no auto-load).`,
       "success",
     );
   } catch (err) {
@@ -792,13 +812,17 @@ async function pickModelLibraryFolder() {
     sendModelLibraryToWorker();
     await refreshModelLibScan();
     await refreshModelDownloadStatus();
-    // Reload current model so worker re-reads from the new library
-    if (ready || worker) {
-      startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
+    // Do not auto-load weights — user downloads/selects after setting the folder
+    if (worker) {
+      try {
+        worker.terminate();
+      } catch {
+        /* ignore */
+      }
+      worker = null;
     }
-    setStatus(
-      `Model library set to “${handle.name}” (${getModelLibLayout()} layout). Offline only.`,
-      "success",
+    enterSetupMode(
+      `Library “${handle.name}” ready (${getModelLibLayout()}). Download a model if needed, then pick it in the list to load.`,
     );
     return true;
   } catch (e) {
@@ -816,13 +840,18 @@ async function clearModelLibraryFolder() {
     /* ignore */
   }
   updateModelLibUi();
-  sendModelLibraryToWorker();
+  if (worker) {
+    try {
+      worker.terminate();
+    } catch {
+      /* ignore */
+    }
+    worker = null;
+  }
   await refreshModelDownloadStatus();
-  setStatus(
-    "Model library cleared — only self-hosted /models/ on this site are used (no online HF).",
-    "success",
+  enterSetupMode(
+    "Model library cleared. Choose a folder under Storage before loading any model.",
   );
-  if (worker) startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
 }
 
 function sendModelLibraryToWorker() {
@@ -860,16 +889,24 @@ function setSelectedModel(key, { load = false } = {}) {
   closeModelMenu();
 
   if (load) {
+    if (!modelLibDirHandle) {
+      const details = document.getElementById("save-settings");
+      if (details) details.open = true;
+      setStatus(
+        "Choose a model library folder under Storage first (where models are stored locally).",
+        "error",
+      );
+      return;
+    }
     ready = false;
     modelSwitchPending = true;
     setGenerating(false);
     els.generateBtn.disabled = true;
     els.voiceTrigger.disabled = true;
     els.modelTrigger.disabled = true;
-    showOverlay(`Loading ${entry.shortLabel}…`);
-    setStatus(`Switching to ${entry.shortLabel}…`);
-    // Fresh worker avoids stuck ORT / half-initialized sessions
-    startWorker(entry.key);
+    showOverlay(`Loading ${entry.shortLabel} from your folder…`);
+    setStatus(`Loading ${entry.shortLabel} from local library…`);
+    startWorker(entry.key, { autoLoad: true });
   }
 }
 
@@ -1490,13 +1527,16 @@ function handleWorkerMessage(event) {
 
   switch (data.type) {
     case "worker-ready": {
-      // Attach library before first model load (offline path)
+      // Attach library; only load when user explicitly requested a model
       sendModelLibraryToWorker();
-      worker?.postMessage({
-        type: "load-model",
-        modelKey: pendingWorkerModelKey || selectedModelKey || DEFAULT_MODEL_KEY,
-      });
-      pendingWorkerModelKey = null;
+      if (pendingWorkerModelKey) {
+        const key = pendingWorkerModelKey;
+        pendingWorkerModelKey = null;
+        worker?.postMessage({ type: "load-model", modelKey: key });
+      } else {
+        // Idle worker — no auto-load, no overlay
+        hideOverlay();
+      }
       break;
     }
     case "status": {
@@ -1589,13 +1629,15 @@ function handleWorkerMessage(event) {
     case "error": {
       setGenerating(false);
       modelSwitchPending = false;
-      els.modelTrigger.disabled = false;
+      if (els.modelTrigger) els.modelTrigger.disabled = false;
       const message = data.message || "Something went wrong.";
       setStatus(message, "error");
       if (!ready) {
-        els.loadingMessage.textContent = message;
-        els.progressDetail.textContent = "Failed";
+        if (els.loadingMessage) els.loadingMessage.textContent = message;
+        if (els.progressDetail) els.progressDetail.textContent = "Failed";
       }
+      // Don't leave the startup-style overlay stuck on failure
+      hideOverlay();
       break;
     }
     default:
@@ -1607,8 +1649,11 @@ function handleWorkerError(error) {
   console.error("Worker error:", error);
   const message = error?.message || "Worker failed to start.";
   setStatus(message, "error");
-  els.loadingMessage.textContent = message;
+  if (els.loadingMessage) els.loadingMessage.textContent = message;
   setGenerating(false);
+  modelSwitchPending = false;
+  if (els.modelTrigger) els.modelTrigger.disabled = false;
+  hideOverlay();
 }
 
 function loadLocalSettings() {
@@ -1754,8 +1799,10 @@ function bindEvents() {
     await refreshModelLibScan();
     await refreshModelDownloadStatus();
     setStatus(`Library layout: ${getModelLibLayout()}.`, "success");
-    if (modelLibDirHandle && worker) {
-      startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
+    // Only reload if a model was already active
+    if (modelLibDirHandle && ready) {
+      startWorker(selectedModelKey || DEFAULT_MODEL_KEY, { autoLoad: true });
+      showOverlay("Reloading model with new layout…");
     }
   });
 
@@ -1811,11 +1858,16 @@ function bindEvents() {
 }
 
 /**
- * Create (or recreate) the inference worker and load a model.
- * @param {string} [modelKey]
+ * Create (or recreate) the inference worker.
+ * @param {string} [modelKey] if set with autoLoad, loads that model after ready
+ * @param {{ autoLoad?: boolean }} [opts]
  */
-function startWorker(modelKey) {
-  pendingWorkerModelKey = modelKey || selectedModelKey || DEFAULT_MODEL_KEY;
+function startWorker(modelKey, opts = {}) {
+  // Only load weights when explicitly requested (never on cold start)
+  const autoLoad = opts.autoLoad === true;
+  pendingWorkerModelKey = autoLoad
+    ? modelKey || selectedModelKey || DEFAULT_MODEL_KEY
+    : null;
   if (worker) {
     try {
       worker.terminate();
@@ -1840,10 +1892,24 @@ async function main() {
   bindEvents();
   await restoreSaveDirectory();
 
-  setStatus("Starting Knull & Clear…");
-  els.loadingMessage.textContent = "Starting worker…";
-  showOverlay("Starting worker…");
-  startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
+  // No startup model load / no "Tuning" overlay — library first
+  hideOverlay();
+  if (els.modelTrigger) els.modelTrigger.disabled = false;
+  if (els.generateBtn) els.generateBtn.disabled = true;
+  if (els.voiceTrigger) els.voiceTrigger.disabled = true;
+  if (els.deviceBadge) els.deviceBadge.textContent = "device: — · setup";
+
+  if (!modelLibDirHandle) {
+    enterSetupMode(
+      "Welcome. Open Storage → choose a model library folder on your PC, Download a model, then select it to load.",
+    );
+    const details = document.getElementById("save-settings");
+    if (details) details.open = true;
+  } else {
+    enterSetupMode(
+      `Library “${modelLibDirHandle.name}” is set. Download if needed, then select a model to load from disk.`,
+    );
+  }
 }
 
 main();
