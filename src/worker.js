@@ -685,9 +685,11 @@ async function pickRuntime(preferWebGPU) {
   const pickDevice = (dtype) => {
     if (devicePref === "wasm") return "wasm";
     if (devicePref === "webgpu") return preferWebGPU ? "webgpu" : "wasm";
-    // auto: fp32 can use webgpu; quantized stays on wasm for accuracy
+    // Prefer WASM for all dtypes — WebGPU fp32/q4 paths often produce noisy audio
+    // on consumer GPUs with ORT web. fp32 still works on wasm (slower, cleaner).
     if (dtype === "fp32" || dtype === "fp16") {
-      return preferWebGPU ? "webgpu" : "wasm";
+      // Only use webgpu when explicitly preferred and available
+      return devicePref === "webgpu" && preferWebGPU ? "webgpu" : "wasm";
     }
     return "wasm";
   };
@@ -758,9 +760,101 @@ async function pickRuntime(preferWebGPU) {
 /** Split long text so each chunk stays within Kokoro's comfortable length. */
 const SENTENCE_SPLIT = /(?<=[.!?…])\s+|\n+/;
 
-/** Encode float32 mono samples as IEEE-float WAV (same format as transformers.js). */
+/**
+ * Coerce kokoro / transformers audio output to a plain Float32Array.
+ * @param {unknown} audioOut
+ * @returns {{ samples: Float32Array, sampleRate: number }}
+ */
+function extractAudio(audioOut) {
+  const rate =
+    Number(audioOut?.sampling_rate) ||
+    Number(audioOut?.sample_rate) ||
+    Number(audioOut?.sr) ||
+    24000;
+
+  let raw =
+    audioOut?.audio ??
+    audioOut?.data ??
+    audioOut?.array ??
+    audioOut;
+
+  // Nested tensor-like: { data: Float32Array } or TypedArray
+  if (raw && !(raw instanceof Float32Array) && raw.data) {
+    raw = raw.data;
+  }
+
+  let samples;
+  if (raw instanceof Float32Array) {
+    samples = raw;
+  } else if (ArrayBuffer.isView(raw)) {
+    // Copy into Float32 view of the underlying buffer carefully
+    samples = new Float32Array(
+      raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength),
+    );
+  } else if (Array.isArray(raw)) {
+    samples = Float32Array.from(raw);
+  } else {
+    throw new Error("Model returned unexpected audio format.");
+  }
+
+  if (!samples.length) {
+    throw new Error("Model returned empty audio.");
+  }
+
+  return { samples, sampleRate: rate > 0 ? rate : 24000 };
+}
+
+/**
+ * Peak-normalize to ~0.95 and soft-clip. Prevents harsh clipping/distortion
+ * when models (esp. q4 / fp32) output peaks outside [-1, 1].
+ * @param {Float32Array} samples
+ */
+function normalizeAudio(samples) {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const a = Math.abs(samples[i]);
+    if (a > peak) peak = a;
+  }
+  if (!Number.isFinite(peak) || peak < 1e-8) {
+    return samples;
+  }
+  // Only scale down if clipping / very hot; gently lift very quiet audio
+  let gain = 1;
+  if (peak > 0.99) gain = 0.95 / peak;
+  else if (peak < 0.08) gain = Math.min(0.9 / peak, 4);
+
+  if (Math.abs(gain - 1) < 0.01) {
+    // Still soft-clip any stragglers
+    for (let i = 0; i < samples.length; i++) {
+      const x = samples[i];
+      samples[i] = x < -1 ? -1 : x > 1 ? 1 : x;
+    }
+    return samples;
+  }
+
+  for (let i = 0; i < samples.length; i++) {
+    let x = samples[i] * gain;
+    // soft clip
+    if (x > 1) x = 1;
+    else if (x < -1) x = -1;
+    samples[i] = x;
+  }
+  return samples;
+}
+
+/**
+ * Encode mono float samples as 16-bit PCM WAV (widely compatible).
+ * IEEE float WAV (format 3) is often misread as garbage by players / editors.
+ * @param {Float32Array} samples
+ * @param {number} [sampleRate=24000]
+ */
 function floatToWavBlob(samples, sampleRate = 24000) {
-  const dataSize = samples.length * 4;
+  const pcm = normalizeAudio(
+    samples instanceof Float32Array
+      ? samples.slice()
+      : Float32Array.from(samples),
+  );
+  const dataSize = pcm.length * 2;
   const buffer = new ArrayBuffer(44 + dataSize);
   const view = new DataView(buffer);
   const writeStr = (offset, str) => {
@@ -773,57 +867,109 @@ function floatToWavBlob(samples, sampleRate = 24000) {
   writeStr(8, "WAVE");
   writeStr(12, "fmt ");
   view.setUint32(16, 16, true);
-  view.setUint16(20, 3, true); // IEEE float
+  view.setUint16(20, 1, true); // PCM
   view.setUint16(22, 1, true); // mono
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 4, true);
-  view.setUint16(32, 4, true);
-  view.setUint16(34, 32, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
   writeStr(36, "data");
   view.setUint32(40, dataSize, true);
   let o = 44;
-  for (let i = 0; i < samples.length; i++, o += 4) {
-    view.setFloat32(o, samples[i], true);
+  for (let i = 0; i < pcm.length; i++, o += 2) {
+    // float [-1,1] → int16
+    let s = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
   return new Blob([buffer], { type: "audio/wav" });
 }
 
 /**
+ * Merge chunks with a short crossfade to avoid clicks between sentences.
+ * @param {Float32Array[]} chunks
+ * @param {number} sampleRate
+ */
+function mergeWithCrossfade(chunks, sampleRate) {
+  if (chunks.length === 0) return new Float32Array(0);
+  if (chunks.length === 1) return chunks[0];
+
+  const fade = Math.min(
+    Math.floor(sampleRate * 0.012), // ~12ms
+    ...chunks.map((c) => Math.floor(c.length / 3)),
+  );
+  const safeFade = Math.max(0, fade);
+
+  let total = chunks[0].length;
+  for (let i = 1; i < chunks.length; i++) {
+    total += chunks[i].length - safeFade;
+  }
+  const out = new Float32Array(total);
+  out.set(chunks[0], 0);
+  let offset = chunks[0].length;
+
+  for (let i = 1; i < chunks.length; i++) {
+    const cur = chunks[i];
+    const start = offset - safeFade;
+    for (let j = 0; j < safeFade; j++) {
+      const t = j / safeFade;
+      const a = out[start + j] * (1 - t);
+      const b = cur[j] * t;
+      out[start + j] = a + b;
+    }
+    out.set(cur.subarray(safeFade), offset);
+    offset += cur.length - safeFade;
+  }
+  return out;
+}
+
+/**
  * Generate speech, splitting multi-sentence input for better accuracy.
- * Single-pass generate() truncates long inputs and can hurt prosody.
+ * Always encodes 16-bit PCM WAV so every model sounds clean in players.
  */
 async function synthesizeToBlob(text, voice, speed) {
+  const safeSpeed = Math.min(1.5, Math.max(0.5, Number(speed) || 1));
   const chunks = text
     .split(SENTENCE_SPLIT)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 
-  const parts = chunks.length > 0 ? chunks : [text];
-
-  if (parts.length === 1 && parts[0].length < 280) {
-    const audio = await tts.generate(parts[0], { voice, speed });
-    return audio.toBlob();
+  // Prefer moderate chunk sizes — very long single passes hurt quality on q4/fp32
+  /** @type {string[]} */
+  const parts = [];
+  for (const c of chunks.length > 0 ? chunks : [text]) {
+    if (c.length <= 220) {
+      parts.push(c);
+    } else {
+      // hard-split long sentences on commas / spaces
+      let rest = c;
+      while (rest.length > 220) {
+        let cut = rest.lastIndexOf(",", 220);
+        if (cut < 80) cut = rest.lastIndexOf(" ", 220);
+        if (cut < 80) cut = 220;
+        parts.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+      }
+      if (rest) parts.push(rest);
+    }
   }
+  if (parts.length === 0) parts.push(text);
 
-  const samples = [];
+  const sampleChunks = [];
   let sampleRate = 24000;
   for (let i = 0; i < parts.length; i++) {
-    self.postMessage({
-      type: "status",
-      message: `Generating speech… (${i + 1}/${parts.length})`,
-    });
-    const audio = await tts.generate(parts[i], { voice, speed });
-    samples.push(audio.audio);
-    sampleRate = audio.sampling_rate || sampleRate;
+    if (parts.length > 1) {
+      self.postMessage({
+        type: "status",
+        message: `Generating speech… (${i + 1}/${parts.length})`,
+      });
+    }
+    const raw = await tts.generate(parts[i], { voice, speed: safeSpeed });
+    const { samples, sampleRate: sr } = extractAudio(raw);
+    sampleChunks.push(samples);
+    sampleRate = sr || sampleRate;
   }
 
-  const total = samples.reduce((n, a) => n + a.length, 0);
-  const merged = new Float32Array(total);
-  let offset = 0;
-  for (const s of samples) {
-    merged.set(s, offset);
-    offset += s.length;
-  }
+  const merged = mergeWithCrossfade(sampleChunks, sampleRate);
   return floatToWavBlob(merged, sampleRate);
 }
 
