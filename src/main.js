@@ -12,6 +12,7 @@ import {
   downloadEntryFiles,
   downloadVoicesToLibrary,
   isEntryInLibrary,
+  readLibraryModelFile,
   scanLibraryCatalog,
 } from "./modelLibrary.js";
 import { ENGLISH_VOICES } from "./modelCatalog.js";
@@ -707,7 +708,6 @@ async function refreshVoiceOnDiskStatus() {
     return;
   }
   const entry = getModelEntry(selectedModelKey);
-  const { readLibraryModelFile } = await import("./modelLibrary.js");
   const ids = voiceOptions.length
     ? voiceOptions.map((v) => v.value)
     : ENGLISH_VOICES;
