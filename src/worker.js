@@ -76,64 +76,62 @@ async function readLibraryAbsolute(relativePath) {
 }
 
 /**
+ * A model pack: tokenizer + config + onnx weights (any nesting under library).
  * @param {FileSystemDirectoryHandle} dir
  */
 async function isPackDir(dir) {
+  let hasConfig = false;
+  let hasTokenizer = false;
+  let hasOnnx = false;
   try {
     await dir.getFileHandle("config.json");
+    hasConfig = true;
+  } catch {
+    /* optional soft */
+  }
+  try {
+    await dir.getFileHandle("tokenizer.json");
+    hasTokenizer = true;
+  } catch {
+    /* optional soft */
+  }
+  try {
     const onnx = await dir.getDirectoryHandle("onnx");
     for await (const [name, h] of onnx.entries()) {
-      if (h.kind === "file" && name.endsWith(".onnx")) return true;
+      if (h.kind === "file" && name.endsWith(".onnx")) {
+        hasOnnx = true;
+        break;
+      }
     }
   } catch {
-    return false;
+    /* no onnx dir */
   }
-  return false;
+  // Also accept .onnx sitting next to config (rare)
+  if (!hasOnnx) {
+    try {
+      for await (const [name, h] of dir.entries()) {
+        if (h.kind === "file" && name.endsWith(".onnx")) {
+          hasOnnx = true;
+          break;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  // Need weights + at least one of the json sidecars
+  return hasOnnx && (hasConfig || hasTokenizer);
 }
 
 /**
- * Find pack dir for modelId under nested folders (cached).
- * @param {string} modelId
- * @returns {Promise<FileSystemDirectoryHandle | null>}
+ * List every pack under the library root (nested).
+ * @returns {Promise<{ path: string, name: string, handle: FileSystemDirectoryHandle }[]>}
  */
-async function resolvePackDir(modelId) {
-  if (!modelLibraryRoot) return null;
-  // Only cache positive hits — a prior miss would block finds after Download
-  if (packDirCache.has(modelId)) return packDirCache.get(modelId);
-
-  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
-  const segments = id.split("/").filter(Boolean);
-  const short = segments[segments.length - 1] || id;
-
-  const tryRel = async (rel) => {
-    try {
-      const parts = rel.split("/").filter(Boolean);
-      let dir = modelLibraryRoot;
-      for (const p of parts) dir = await dir.getDirectoryHandle(p);
-      if (await isPackDir(dir)) return dir;
-    } catch {
-      /* miss */
-    }
-    return null;
-  };
-
-  for (const rel of [
-    `models/${id}`,
-    id,
-    `models/${short}`,
-    short,
-  ]) {
-    const hit = await tryRel(rel);
-    if (hit) {
-      packDirCache.set(modelId, hit);
-      return hit;
-    }
-  }
-
-  // Nested walk (depth-limited)
-  const maxDepth = 8;
-  /** @type {FileSystemDirectoryHandle | null} */
-  let found = null;
+async function listAllPacks() {
+  if (!modelLibraryRoot) return [];
+  /** @type {{ path: string, name: string, handle: FileSystemDirectoryHandle }[]} */
+  const packs = [];
+  const maxDepth = 10;
 
   /**
    * @param {FileSystemDirectoryHandle} dir
@@ -141,20 +139,11 @@ async function resolvePackDir(modelId) {
    * @param {number} depth
    */
   async function walk(dir, rel, depth) {
-    if (found || depth > maxDepth) return;
+    if (depth > maxDepth) return;
     if (await isPackDir(dir)) {
-      const name = rel ? rel.split("/").pop() : dir.name;
-      if (
-        rel === id ||
-        rel.endsWith(`/${id}`) ||
-        rel.endsWith(id) ||
-        rel.includes(id) ||
-        name === short
-      ) {
-        found = dir;
-        return;
-      }
-      return;
+      const name = rel ? rel.split("/").pop() || rel : dir.name;
+      packs.push({ path: rel || name, name, handle: dir });
+      return; // don't walk inside a pack
     }
     try {
       for await (const [name, handle] of dir.entries()) {
@@ -168,7 +157,6 @@ async function resolvePackDir(modelId) {
           continue;
         }
         await walk(handle, rel ? `${rel}/${name}` : name, depth + 1);
-        if (found) return;
       }
     } catch {
       /* ignore */
@@ -176,12 +164,125 @@ async function resolvePackDir(modelId) {
   }
 
   await walk(modelLibraryRoot, "", 0);
-  if (found) packDirCache.set(modelId, found);
-  return found;
+  return packs;
 }
 
 /**
- * Read from library: fixed models/ path, then nested auto-scan.
+ * Score how well a discovered pack path matches a modelId.
+ * @param {string} packPath
+ * @param {string} packName
+ * @param {string} modelId
+ */
+function packMatchScore(packPath, packName, modelId) {
+  const id = modelId.replace(/^\/+|\/+$/g, "");
+  const short = id.split("/").pop() || id;
+  const path = (packPath || "").replace(/\\/g, "/");
+  const name = packName || "";
+  let score = 0;
+  if (path === id || path === `models/${id}`) score += 100;
+  if (path.endsWith(`/${id}`) || path.endsWith(id)) score += 80;
+  if (path.includes(id)) score += 50;
+  if (name === short || name.toLowerCase() === short.toLowerCase()) score += 40;
+  if (path.toLowerCase().includes(short.toLowerCase())) score += 25;
+  // org segment
+  const org = id.split("/")[0];
+  if (org && path.includes(org)) score += 10;
+  if (/kokoro/i.test(name) && /kokoro/i.test(short)) score += 15;
+  return score;
+}
+
+/**
+ * Find pack dir for modelId under nested folders (cached).
+ * @param {string} modelId
+ * @returns {Promise<FileSystemDirectoryHandle | null>}
+ */
+async function resolvePackDir(modelId) {
+  if (!modelLibraryRoot) return null;
+  if (packDirCache.has(modelId)) return packDirCache.get(modelId);
+
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const short = id.split("/").pop() || id;
+
+  const tryRel = async (rel) => {
+    try {
+      const parts = rel.split("/").filter(Boolean);
+      let dir = modelLibraryRoot;
+      for (const p of parts) dir = await dir.getDirectoryHandle(p);
+      if (await isPackDir(dir)) return dir;
+    } catch {
+      /* miss */
+    }
+    return null;
+  };
+
+  // Fast exact relative paths
+  for (const rel of [
+    `models/${id}`,
+    id,
+    `models/${short}`,
+    short,
+    // user picked the pack folder itself
+    "",
+  ]) {
+    if (rel === "") {
+      if (await isPackDir(modelLibraryRoot)) {
+        packDirCache.set(modelId, modelLibraryRoot);
+        return modelLibraryRoot;
+      }
+      continue;
+    }
+    const hit = await tryRel(rel);
+    if (hit) {
+      packDirCache.set(modelId, hit);
+      return hit;
+    }
+  }
+
+  // Deep scan + best match
+  const packs = await listAllPacks();
+  if (packs.length === 0) return null;
+
+  let best = null;
+  let bestScore = 0;
+  for (const p of packs) {
+    const s = packMatchScore(p.path, p.name, id);
+    if (s > bestScore) {
+      bestScore = s;
+      best = p;
+    }
+  }
+
+  // Only accept a reasonable match, or the sole pack in the library
+  if (best && (bestScore >= 25 || packs.length === 1)) {
+    packDirCache.set(modelId, best.handle);
+    return best.handle;
+  }
+  return null;
+}
+
+/**
+ * Read a file relative to a pack directory handle.
+ * @param {FileSystemDirectoryHandle} pack
+ * @param {string} fileRel
+ */
+async function readFromPack(pack, fileRel) {
+  try {
+    const parts = String(fileRel).replace(/^\/+/, "").split("/").filter(Boolean);
+    let dir = pack;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i]);
+    }
+    const fh = await dir.getFileHandle(parts[parts.length - 1]);
+    const f = await fh.getFile();
+    if (!f.size) return null;
+    return await f.arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read from library: fixed models/ path, then nested pack locate.
  * @param {string} modelId
  * @param {string} fileRel
  */
@@ -196,6 +297,7 @@ async function readFromModelLibrary(modelId, fileRel) {
     `${id}/${file}`,
     `models/${short}/${file}`,
     `${short}/${file}`,
+    file, // root is the pack
   ]) {
     const buf = await readLibraryAbsolute(rel.replace(/\/+/g, "/"));
     if (buf) return buf;
@@ -203,19 +305,7 @@ async function readFromModelLibrary(modelId, fileRel) {
 
   const pack = await resolvePackDir(modelId);
   if (!pack) return null;
-  try {
-    const parts = file.split("/").filter(Boolean);
-    let dir = pack;
-    for (let i = 0; i < parts.length - 1; i++) {
-      dir = await dir.getDirectoryHandle(parts[i]);
-    }
-    const fh = await dir.getFileHandle(parts[parts.length - 1]);
-    const f = await fh.getFile();
-    if (!f.size) return null;
-    return await f.arrayBuffer();
-  } catch {
-    return null;
-  }
+  return readFromPack(pack, file);
 }
 
 /**
@@ -1024,6 +1114,7 @@ let loadGeneration = 0;
 
 /**
  * Ensure tokenizer/config exist in the user library before from_pretrained.
+ * Uses nested pack discovery so deep folders still work.
  */
 async function assertModelFilesPresent() {
   if (!modelLibraryRoot) {
@@ -1031,17 +1122,45 @@ async function assertModelFilesPresent() {
       `All models are local-only. Storage → Choose folder…, Download “${activeModel.shortLabel}”, then select it again.`,
     );
   }
+
+  // Clear cache so a fresh Download is visible
+  packDirCache.delete(MODEL_ID);
+
+  const pack = await resolvePackDir(MODEL_ID);
   const needed = ["tokenizer.json", "config.json", "tokenizer_config.json"];
   const missing = [];
+  const found = [];
+
   for (const f of needed) {
-    const buf = await readFromModelLibrary(MODEL_ID, f);
-    if (!buf || buf.byteLength === 0) missing.push(f);
+    let buf = null;
+    if (pack) buf = await readFromPack(pack, f);
+    if (!buf || buf.byteLength === 0) {
+      buf = await readFromModelLibrary(MODEL_ID, f);
+    }
+    if (buf && buf.byteLength > 0) found.push(f);
+    else missing.push(f);
   }
-  if (missing.length) {
+
+  if (missing.length === 0) return;
+
+  const packs = await listAllPacks();
+  const packHint =
+    packs.length > 0
+      ? ` Found pack folder(s): ${packs
+          .slice(0, 5)
+          .map((p) => p.path || p.name)
+          .join(", ")}${packs.length > 5 ? "…" : ""}.`
+      : " No model pack folders found under your library (need config/tokenizer + onnx/).";
+
+  if (!pack) {
     throw new Error(
-      `Missing in your library for ${MODEL_ID}: ${missing.join(", ")}. Download “${activeModel.shortLabel}” first.`,
+      `Could not locate pack “${MODEL_ID}” under your library.${packHint} Pick the parent folder that contains models/, or Download “${activeModel.shortLabel}”.`,
     );
   }
+
+  throw new Error(
+    `Pack found but incomplete for ${MODEL_ID}. Missing: ${missing.join(", ")}.${packHint} Use Download on “${activeModel.shortLabel}” to fill tokenizer/config.`,
+  );
 }
 
 async function loadModel(device, dtype) {

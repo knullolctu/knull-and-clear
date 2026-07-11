@@ -112,20 +112,45 @@ export async function libraryFileSize(root, relativePath) {
  * @param {FileSystemDirectoryHandle} dir
  */
 export async function isModelPackDir(dir) {
+  let hasConfig = false;
+  let hasTokenizer = false;
+  let hasOnnx = false;
   try {
     await dir.getFileHandle("config.json");
+    hasConfig = true;
   } catch {
-    return false;
+    /* */
+  }
+  try {
+    await dir.getFileHandle("tokenizer.json");
+    hasTokenizer = true;
+  } catch {
+    /* */
   }
   try {
     const onnx = await dir.getDirectoryHandle("onnx");
     for await (const [name, handle] of onnx.entries()) {
-      if (handle.kind === "file" && name.endsWith(".onnx")) return true;
+      if (handle.kind === "file" && name.endsWith(".onnx")) {
+        hasOnnx = true;
+        break;
+      }
     }
   } catch {
-    return false;
+    /* */
   }
-  return false;
+  if (!hasOnnx) {
+    try {
+      for await (const [name, handle] of dir.entries()) {
+        if (handle.kind === "file" && name.endsWith(".onnx")) {
+          hasOnnx = true;
+          break;
+        }
+      }
+    } catch {
+      /* */
+    }
+  }
+  return hasOnnx && (hasConfig || hasTokenizer);
 }
 
 /**
@@ -188,6 +213,9 @@ export async function resolveModelPackDir(root, modelId) {
   const segments = id.split("/").filter(Boolean);
   const short = segments[segments.length - 1] || id;
 
+  // Root itself is the pack
+  if (await isModelPackDir(root)) return root;
+
   // Fast path: fixed write locations
   const directPaths = [
     `${LIBRARY_MODELS_PREFIX}/${id}`,
@@ -206,26 +234,29 @@ export async function resolveModelPackDir(root, modelId) {
     }
   }
 
-  // Nested scan: match full path ending or folder name
   const packs = await findNestedModelPacks(root);
-  // Prefer path ending with full modelId
+  if (packs.length === 0) return null;
+  if (packs.length === 1) return packs[0].handle;
+
+  let best = null;
+  let bestScore = 0;
   for (const p of packs) {
-    if (p.path === id || p.path.endsWith(`/${id}`) || p.path.endsWith(id)) {
-      return p.handle;
+    const path = (p.path || "").replace(/\\/g, "/");
+    const name = p.name || "";
+    let score = 0;
+    if (path === id || path === `models/${id}`) score += 100;
+    if (path.endsWith(`/${id}`) || path.endsWith(id)) score += 80;
+    if (path.includes(id)) score += 50;
+    if (name === short || name.toLowerCase() === short.toLowerCase()) score += 40;
+    if (path.toLowerCase().includes(short.toLowerCase())) score += 25;
+    if (segments[0] && path.includes(segments[0])) score += 10;
+    if (/kokoro/i.test(name) && /kokoro/i.test(short)) score += 15;
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
     }
   }
-  // Path contains org/name segments in order
-  for (const p of packs) {
-    if (segments.length >= 2) {
-      const needle = segments.join("/");
-      if (p.path.includes(needle)) return p.handle;
-    }
-  }
-  // Name match (last segment)
-  for (const p of packs) {
-    if (p.name === short) return p.handle;
-  }
-  return null;
+  return bestScore >= 25 && best ? best.handle : null;
 }
 
 /**
