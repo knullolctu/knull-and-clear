@@ -1,0 +1,10 @@
+node_modules
+dist
+.DS_Store
+*.log
+.vite
+
+# Models are stored on each user's PC (model library folder), not on GitHub Pages.
+# Local dev can still use public/models via `npm run download-model`.
+public/models/**
+!public/models/.gitkeep

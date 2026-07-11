@@ -1,0 +1,898 @@
+import { KokoroTTS } from "kokoro-js";
+// Use Transformers.js env directly — kokoro-js re-exports a thin subset only.
+import { env } from "@huggingface/transformers";
+import {
+  DEFAULT_MODEL_KEY,
+  getModelEntry,
+} from "./modelCatalog.js";
+
+/**
+ * Local model folder (Vite serves /public at site root).
+ * When hosted on GitHub Pages at /repo-name/, BASE_URL is "/repo-name/".
+ */
+const BASE_URL = import.meta.env.BASE_URL || "/";
+const LOCAL_MODEL_PATH = new URL("models/", self.location.origin + BASE_URL)
+  .pathname.replace(/\/?$/, "/");
+/** Shared English voice packs live next to the v1 model. */
+const V1_MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
+const V1_VOICES_BASE = new URL(
+  `models/${V1_MODEL_ID}/`,
+  self.location.origin + BASE_URL,
+).pathname.replace(/\/?$/, "/");
+
+// Prefer self-hosted model + voices (GitHub Pages / local public/models)
+env.allowLocalModels = true;
+env.localModelPath = LOCAL_MODEL_PATH;
+// Still allow HF as a fallback if local files are missing during dev
+env.allowRemoteModels = true;
+// Corrupt / partial Cache API entries are a common cause of loads that stall
+// after tokenizer files with no further progress. Prefer re-reading local files.
+env.useBrowserCache = false;
+
+/**
+ * Single-threaded ORT wasm. Dev: same-origin node_modules. Prod (Pages): CDN.
+ * Multi-threaded WASM + COEP can hang after tokenizer with no further events.
+ */
+function configureOrtWasm() {
+  try {
+    const onnxEnv = env.backends?.onnx;
+    if (!onnxEnv?.wasm) return;
+    onnxEnv.wasm.numThreads = 1;
+    onnxEnv.wasm.proxy = false;
+    if (import.meta.env.DEV) {
+      onnxEnv.wasm.wasmPaths = `${self.location.origin}/node_modules/@huggingface/transformers/dist/`;
+    } else {
+      // GitHub Pages has no node_modules — use jsDelivr (sends CORP for COEP)
+      onnxEnv.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${env.version}/dist/`;
+    }
+  } catch (e) {
+    console.warn("ORT wasm config failed", e);
+  }
+}
+
+/** @type {FileSystemDirectoryHandle | null} */
+let modelLibraryRoot = null;
+
+/**
+ * Read a file from the user model library: {root}/{modelId}/...
+ * @param {string} relativePath e.g. onnx-community/Kokoro-…/onnx/model_quantized.onnx
+ */
+async function readFromModelLibrary(relativePath) {
+  if (!modelLibraryRoot) return null;
+  try {
+    const parts = relativePath.split("/").filter(Boolean);
+    let dir = modelLibraryRoot;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i]);
+    }
+    const fh = await dir.getFileHandle(parts[parts.length - 1]);
+    const file = await fh.getFile();
+    if (!file.size) return null;
+    return await file.arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
+function libraryResponse(buf, contentType = "application/octet-stream") {
+  return new Response(buf.slice(0), {
+    status: 200,
+    headers: {
+      "Content-Type": contentType,
+      "Content-Disposition": "inline",
+      "Content-Length": String(buf.byteLength),
+    },
+  });
+}
+
+/** Active model selection (mutable — user can switch at runtime). */
+let activeModelKey = DEFAULT_MODEL_KEY;
+let activeModel = getModelEntry(activeModelKey);
+let MODEL_ID = activeModel.modelId;
+let MODEL_BASE = new URL(
+  `models/${MODEL_ID}/`,
+  self.location.origin + BASE_URL,
+).pathname.replace(/\/?$/, "/");
+
+function applyModelSelection(modelKey) {
+  activeModelKey = modelKey || DEFAULT_MODEL_KEY;
+  activeModel = getModelEntry(activeModelKey);
+  MODEL_ID = activeModel.modelId;
+  MODEL_BASE = new URL(
+    `models/${MODEL_ID}/`,
+    self.location.origin + BASE_URL,
+  ).pathname.replace(/\/?$/, "/");
+}
+
+/**
+ * kokoro-js hardcodes Hugging Face URLs for voice .bin files in the browser.
+ * Rewrite those requests to our self-hosted copies under /models/.../voices/.
+ *
+ * Style vectors are 256 float32s; an empty/204 response yields
+ * "Tensor's size(256) does not match data length(0)".
+ */
+const HF_VOICE_RE =
+  /https:\/\/huggingface\.co\/([^/]+\/[^/]+)\/resolve\/[^/]+\/voices\/([^/?#]+\.bin)/i;
+/** Minimum bytes for one style row (256 × float32). Real files are ~510 KB. */
+const MIN_VOICE_BYTES = 256 * 4;
+
+const originalFetch = self.fetch.bind(self);
+
+/** In-memory voice bytes — one fetch per voice per session. */
+const voiceMemory = new Map();
+/** In-flight fetches so parallel requests for the same voice share one download. */
+const voiceInflight = new Map();
+
+const HF_VOICE_URL = (fileName, modelId = MODEL_ID) =>
+  `https://huggingface.co/${modelId}/resolve/main/voices/${fileName}`;
+
+/** English voices shipped by `npm run download-model` (no need to HEAD all files). */
+const LOCAL_ENGLISH_VOICES = [
+  "af_alloy",
+  "af_aoede",
+  "af_bella",
+  "af_heart",
+  "af_jessica",
+  "af_kore",
+  "af_nicole",
+  "af_nova",
+  "af_river",
+  "af_sarah",
+  "af_sky",
+  "am_adam",
+  "am_echo",
+  "am_eric",
+  "am_fenrir",
+  "am_liam",
+  "am_michael",
+  "am_onyx",
+  "am_puck",
+  "am_santa",
+  "bf_alice",
+  "bf_emma",
+  "bf_isabella",
+  "bf_lily",
+  "bm_daniel",
+  "bm_fable",
+  "bm_george",
+  "bm_lewis",
+];
+
+function voiceResponse(buf) {
+  return new Response(buf.slice(0), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": "inline",
+      "Content-Length": String(buf.byteLength),
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+
+async function readFromVoiceCache(fileName) {
+  if (typeof caches === "undefined") return null;
+  try {
+    const cache = await caches.open("kokoro-voices");
+    const hit = await cache.match(HF_VOICE_URL(fileName));
+    if (!hit || !hit.ok) return null;
+    const len = Number(hit.headers.get("content-length") || 0);
+    if (len > 0 && len < MIN_VOICE_BYTES) {
+      await cache.delete(HF_VOICE_URL(fileName));
+      return null;
+    }
+    const buf = await hit.arrayBuffer();
+    if (buf.byteLength < MIN_VOICE_BYTES) {
+      await cache.delete(HF_VOICE_URL(fileName));
+      return null;
+    }
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
+async function writeToVoiceCache(fileName, buf) {
+  if (typeof caches === "undefined") return;
+  try {
+    const cache = await caches.open("kokoro-voices");
+    await cache.put(HF_VOICE_URL(fileName), voiceResponse(buf));
+  } catch {
+    /* quota / private mode — ignore */
+  }
+}
+
+/**
+ * Load a voice once: memory → Cache API → local disk → Hugging Face.
+ * Later generates for the same voice are free (no network).
+ */
+async function fetchVoiceBuffer(fileName) {
+  if (voiceMemory.has(fileName)) return voiceMemory.get(fileName);
+  if (voiceInflight.has(fileName)) return voiceInflight.get(fileName);
+
+  const job = (async () => {
+    const cached = await readFromVoiceCache(fileName);
+    if (cached) {
+      voiceMemory.set(fileName, cached);
+      return cached;
+    }
+
+    // User model library (custom folder)
+    for (const repo of [MODEL_ID, V1_MODEL_ID]) {
+      const libBuf = await readFromModelLibrary(`${repo}/voices/${fileName}`);
+      if (libBuf && libBuf.byteLength >= MIN_VOICE_BYTES) {
+        voiceMemory.set(fileName, libBuf);
+        await writeToVoiceCache(fileName, libBuf);
+        return libBuf;
+      }
+    }
+
+    // Dev / optional public/models on the host
+    const localCandidates = [
+      `${MODEL_BASE}voices/${fileName}`,
+      `${V1_VOICES_BASE}voices/${fileName}`,
+    ];
+
+    for (const localUrl of localCandidates) {
+      try {
+        const res = await originalFetch(localUrl);
+        if (!res.ok || res.status === 204) continue;
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength < MIN_VOICE_BYTES) continue;
+        voiceMemory.set(fileName, buf);
+        await writeToVoiceCache(fileName, buf);
+        return buf;
+      } catch {
+        /* try next */
+      }
+    }
+
+    console.warn(`Local voice ${fileName} missing; trying Hugging Face…`);
+    const remoteIds = [...new Set([MODEL_ID, V1_MODEL_ID])];
+    for (const repo of remoteIds) {
+      try {
+        const remote = await originalFetch(HF_VOICE_URL(fileName, repo));
+        if (!remote.ok || remote.status === 204) continue;
+        const buf = await remote.arrayBuffer();
+        if (buf.byteLength < MIN_VOICE_BYTES) continue;
+        voiceMemory.set(fileName, buf);
+        await writeToVoiceCache(fileName, buf);
+        return buf;
+      } catch {
+        /* try next repo */
+      }
+    }
+    throw new Error(
+      `Voice "${fileName.replace(/\.bin$/, "")}" not found locally or on Hugging Face.`,
+    );
+  })();
+
+  voiceInflight.set(fileName, job);
+  try {
+    return await job;
+  } finally {
+    voiceInflight.delete(fileName);
+  }
+}
+
+const HF_ANY_FILE_RE =
+  /https:\/\/huggingface\.co\/([^/]+\/[^/]+)\/resolve\/[^/]+\/(.+?)(?:\?|$)/i;
+
+self.fetch = (input, init) => {
+  const url =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input?.url;
+
+  if (typeof url !== "string") {
+    return originalFetch(input, init);
+  }
+
+  // Voice bins (kokoro hardcodes HF URLs)
+  const voiceMatch = url.match(HF_VOICE_RE);
+  if (voiceMatch) {
+    return fetchVoiceBuffer(voiceMatch[2]).then((buf) => voiceResponse(buf));
+  }
+
+  // User library: serve model files without hitting the network
+  if (modelLibraryRoot) {
+    let libRel = null;
+    const hfFile = url.match(HF_ANY_FILE_RE);
+    if (hfFile) {
+      libRel = `${hfFile[1]}/${hfFile[2]}`;
+    } else {
+      // /models/{modelId}/...
+      try {
+        const u = new URL(url, self.location.origin);
+        const m = u.pathname.match(/\/models\/(.+)$/);
+        if (m) libRel = decodeURIComponent(m[1]);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (libRel) {
+      return readFromModelLibrary(libRel).then((buf) => {
+        if (buf) {
+          const ct = libRel.endsWith(".json")
+            ? "application/json"
+            : "application/octet-stream";
+          return libraryResponse(buf, ct);
+        }
+        return originalFetch(input, init);
+      });
+    }
+  }
+
+  return originalFetch(input, init);
+};
+
+/**
+ * Light cleanup: drop cache entries that look empty (by Content-Length only).
+ * Does not re-download or read full bodies for every voice.
+ */
+async function purgeBadVoiceCache() {
+  if (typeof caches === "undefined") return;
+  try {
+    const cache = await caches.open("kokoro-voices");
+    const keys = await cache.keys();
+    await Promise.all(
+      keys.map(async (req) => {
+        const res = await cache.match(req);
+        if (!res || !res.ok || res.status === 204) {
+          await cache.delete(req);
+          return;
+        }
+        const len = Number(res.headers.get("content-length") || 0);
+        if (len > 0 && len < MIN_VOICE_BYTES) await cache.delete(req);
+      }),
+    );
+  } catch (e) {
+    console.warn("Unable to purge voice cache:", e);
+  }
+}
+
+/**
+ * Prefer the English voices we self-host. One cheap HEAD on af_heart.bin
+ * instead of probing every file (avoids a flood of requests on load).
+ */
+async function filterVoicesToLocal(voices) {
+  if (!voices || typeof voices !== "object") return voices;
+
+  let selfHosted = false;
+  try {
+    const res = await originalFetch(`${MODEL_BASE}voices/af_heart.bin`, {
+      method: "HEAD",
+    });
+    const type = (res.headers.get("content-type") || "").toLowerCase();
+    selfHosted =
+      res.ok &&
+      res.status === 200 &&
+      !type.includes("text/html") &&
+      !type.includes("text/plain");
+  } catch {
+    selfHosted = false;
+  }
+
+  if (!selfHosted) return voices;
+
+  const local = {};
+  for (const id of LOCAL_ENGLISH_VOICES) {
+    if (voices[id]) local[id] = voices[id];
+  }
+  return Object.keys(local).length > 0 ? local : voices;
+}
+
+/**
+ * Detect WebGPU support (adapter must be available).
+ */
+async function detectWebGPU() {
+  try {
+    if (!navigator.gpu) return false;
+    const adapter = await navigator.gpu.requestAdapter();
+    return Boolean(adapter);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True only if url is a real ONNX weight file (not SPA HTML fallback).
+ * Vite/GitHub Pages can return 200 + index.html for missing paths, which
+ * would otherwise make HEAD checks lie and cause protobuf parse errors.
+ */
+async function existsOnnx(url) {
+  try {
+    const res = await originalFetch(url, { method: "HEAD" });
+    if (!res.ok) return false;
+
+    const type = (res.headers.get("content-type") || "").toLowerCase();
+    if (type.includes("text/html") || type.includes("text/plain")) return false;
+
+    const len = Number(res.headers.get("content-length") || 0);
+    // Kokoro weights are tens of MB; index.html is a few KB.
+    if (len > 0 && len < 1_000_000) return false;
+
+    // Empty Content-Length + no binary type → verify magic via range GET.
+    if (!len) {
+      const probe = await originalFetch(url, {
+        headers: { Range: "bytes=0-63" },
+      });
+      if (!probe.ok && probe.status !== 206) return false;
+      const probeType = (probe.headers.get("content-type") || "").toLowerCase();
+      if (probeType.includes("text/html")) return false;
+      const buf = new Uint8Array(await probe.arrayBuffer());
+      const head = new TextDecoder().decode(buf).trimStart();
+      if (head.startsWith("<!") || head.startsWith("<html")) return false;
+      // ONNX protobuf often embeds "onnx" near the start
+      if (!head.includes("onnx") && buf.length < 16) return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve ONNX filename for a dtype (transformers.js / kokoro-js convention).
+ * @param {string} dtype
+ */
+function onnxFileForDtype(dtype) {
+  switch (dtype) {
+    case "fp32":
+      return "model.onnx";
+    case "fp16":
+      return "model_fp16.onnx";
+    case "q4":
+      return "model_q4.onnx";
+    case "q4f16":
+      return "model_q4f16.onnx";
+    case "q8":
+    default:
+      return "model_quantized.onnx";
+  }
+}
+
+/**
+ * Pick device + dtype for the active catalog entry.
+ * Respects user-selected model dtype; falls back if weights are missing.
+ */
+async function pickRuntime(preferWebGPU) {
+  const wanted = activeModel.dtype || "q8";
+  const devicePref = activeModel.devicePref || "auto";
+
+  // Only probe the dtype we need (+ q8 fallback). Avoid extra 404 HEADs.
+  const wantedUrl = `${MODEL_BASE}onnx/${onnxFileForDtype(wanted)}`;
+  const q8Url = `${MODEL_BASE}onnx/model_quantized.onnx`;
+  // Shared self-hosted v1 q8 when the selected HF id has no local mirror
+  const v1Q8Url = `${V1_VOICES_BASE}onnx/model_quantized.onnx`;
+
+  const pickDevice = (dtype) => {
+    if (devicePref === "wasm") return "wasm";
+    if (devicePref === "webgpu") return preferWebGPU ? "webgpu" : "wasm";
+    // auto: fp32 can use webgpu; quantized stays on wasm for accuracy
+    if (dtype === "fp32" || dtype === "fp16") {
+      return preferWebGPU ? "webgpu" : "wasm";
+    }
+    return "wasm";
+  };
+
+  const hasWanted = await existsOnnx(wantedUrl);
+  if (hasWanted) {
+    return {
+      device: pickDevice(wanted),
+      dtype: wanted,
+      source: `local-${wanted}`,
+    };
+  }
+
+  // Fall back to local q8 on this model id, then shared v1 q8 pack
+  if (wanted !== "q8") {
+    const hasQ8 = await existsOnnx(q8Url);
+    if (hasQ8) {
+      return { device: "wasm", dtype: "q8", source: "local-q8-fallback" };
+    }
+  }
+
+  if (MODEL_ID !== V1_MODEL_ID) {
+    const hasV1Q8 = await existsOnnx(v1Q8Url);
+    if (hasV1Q8) {
+      // Use self-hosted v1 weights instead of hanging on a remote download
+      MODEL_ID = V1_MODEL_ID;
+      MODEL_BASE = V1_VOICES_BASE;
+      return { device: "wasm", dtype: "q8", source: "local-v1-q8" };
+    }
+  } else {
+    const hasQ8 = await existsOnnx(q8Url);
+    if (hasQ8) {
+      return { device: "wasm", dtype: "q8", source: "local-q8" };
+    }
+  }
+
+  // Remote Hugging Face — use the catalog dtype (may download)
+  return {
+    device: pickDevice(wanted),
+    dtype: wanted,
+    source: "huggingface",
+  };
+}
+
+/** Split long text so each chunk stays within Kokoro's comfortable length. */
+const SENTENCE_SPLIT = /(?<=[.!?…])\s+|\n+/;
+
+/** Encode float32 mono samples as IEEE-float WAV (same format as transformers.js). */
+function floatToWavBlob(samples, sampleRate = 24000) {
+  const dataSize = samples.length * 4;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 3, true); // IEEE float
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 32, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  let o = 44;
+  for (let i = 0; i < samples.length; i++, o += 4) {
+    view.setFloat32(o, samples[i], true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+/**
+ * Generate speech, splitting multi-sentence input for better accuracy.
+ * Single-pass generate() truncates long inputs and can hurt prosody.
+ */
+async function synthesizeToBlob(text, voice, speed) {
+  const chunks = text
+    .split(SENTENCE_SPLIT)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  const parts = chunks.length > 0 ? chunks : [text];
+
+  if (parts.length === 1 && parts[0].length < 280) {
+    const audio = await tts.generate(parts[0], { voice, speed });
+    return audio.toBlob();
+  }
+
+  const samples = [];
+  let sampleRate = 24000;
+  for (let i = 0; i < parts.length; i++) {
+    self.postMessage({
+      type: "status",
+      message: `Generating speech… (${i + 1}/${parts.length})`,
+    });
+    const audio = await tts.generate(parts[i], { voice, speed });
+    samples.push(audio.audio);
+    sampleRate = audio.sampling_rate || sampleRate;
+  }
+
+  const total = samples.reduce((n, a) => n + a.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const s of samples) {
+    merged.set(s, offset);
+    offset += s.length;
+  }
+  return floatToWavBlob(merged, sampleRate);
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let n = bytes;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i += 1;
+  }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function isOnnxFile(file = "") {
+  return /\.onnx$/i.test(file) || /onnx\//i.test(file);
+}
+
+/**
+ * Map per-file callbacks into an overall load bar.
+ * Intermediate files (config/tokenizer) used to jump to 100% and look "stuck"
+ * while the multi‑MB ONNX weights were still loading with no new events.
+ */
+function onProgress(info) {
+  if (!info || typeof info !== "object") return;
+
+  const { status, file, progress, loaded, total } = info;
+  const name = file || "";
+  const onnx = isOnnxFile(name);
+
+  if (status === "progress" && typeof progress === "number") {
+    // Tokenizer/config: 5–35%. ONNX weights: 40–92%.
+    const mapped = onnx
+      ? 40 + Math.min(52, (progress / 100) * 52)
+      : 5 + Math.min(30, (progress / 100) * 30);
+    self.postMessage({
+      type: "progress",
+      progress: mapped,
+      file: name,
+      detail:
+        total != null
+          ? `${name || "file"} · ${formatBytes(loaded)} / ${formatBytes(total)}`
+          : `${name || "file"} · ${Math.round(progress)}%`,
+    });
+    return;
+  }
+
+  if (status === "initiate" || status === "download") {
+    self.postMessage({
+      type: "progress",
+      progress: onnx ? 40 : 8,
+      file: name,
+      detail: onnx
+        ? `Loading weights ${name || ""} (large file — please wait)…`
+        : name
+          ? `Loading ${name}…`
+          : "Loading model files…",
+    });
+    return;
+  }
+
+  if (status === "done") {
+    self.postMessage({
+      type: "progress",
+      progress: onnx ? 92 : 35,
+      file: name,
+      detail: onnx
+        ? `Loaded weights — starting engine…`
+        : name
+          ? `Loaded ${name}`
+          : "Model files ready",
+    });
+  }
+}
+
+let tts = null;
+let busy = false;
+let loading = false;
+/** @type {string | null} */
+let pendingModelKey = null;
+let loadGeneration = 0;
+
+async function loadModel(device, dtype) {
+  return KokoroTTS.from_pretrained(MODEL_ID, {
+    dtype,
+    device,
+    progress_callback: onProgress,
+  });
+}
+
+/**
+ * @param {string} [modelKey]
+ */
+async function init(modelKey) {
+  if (loading) {
+    pendingModelKey = modelKey || DEFAULT_MODEL_KEY;
+    self.postMessage({
+      type: "status",
+      message: "Queued model switch after current load…",
+    });
+    return;
+  }
+
+  loading = true;
+  tts = null;
+  const gen = ++loadGeneration;
+  applyModelSelection(modelKey);
+  configureOrtWasm();
+
+  const heartbeat = setInterval(() => {
+    if (gen !== loadGeneration) return;
+    self.postMessage({
+      type: "status",
+      message: `Still loading ${activeModel.shortLabel}… (weights can take 30–90s on first run)`,
+      modelKey: activeModelKey,
+      modelLabel: activeModel.label,
+    });
+  }, 10000);
+
+  try {
+    // Drop any prior partial downloads that can stall subsequent loads
+    try {
+      if (typeof caches !== "undefined") {
+        await caches.delete("transformers-cache");
+      }
+    } catch {
+      /* ignore */
+    }
+    await purgeBadVoiceCache();
+
+    const hasWebGPU = await detectWebGPU();
+    let pick = await pickRuntime(hasWebGPU);
+    let { device, dtype } = pick;
+
+    // If user asked for a dtype we couldn't find locally and we're on HF,
+    // still use their preferred dtype so remote weights match the catalog.
+    if (pick.source === "huggingface") {
+      dtype = activeModel.dtype || dtype;
+    }
+
+    const sourceLabel =
+      pick.source === "huggingface"
+        ? "Hugging Face (may download weights)"
+        : pick.source;
+
+    self.postMessage({
+      type: "status",
+      message: `Loading ${activeModel.shortLabel} on ${device} (${dtype}) from ${sourceLabel}…`,
+      device,
+      dtype,
+      modelKey: activeModelKey,
+      modelLabel: activeModel.label,
+    });
+    self.postMessage({
+      type: "progress",
+      progress: 5,
+      detail: "Reading config & tokenizer…",
+    });
+
+    try {
+      tts = await loadModel(device, dtype);
+    } catch (error) {
+      // WebGPU/fp32 can fail on some GPUs — fall back to accurate wasm+q8
+      if (device === "webgpu") {
+        self.postMessage({
+          type: "status",
+          message: "WebGPU failed — falling back to WASM + q8…",
+          device: "wasm",
+          dtype: "q8",
+        });
+        device = "wasm";
+        dtype = "q8";
+        tts = await loadModel(device, dtype);
+        pick = {
+          ...pick,
+          source: pick.source.startsWith("local") ? "local-q8" : pick.source,
+        };
+      } else {
+        throw error;
+      }
+    }
+
+    if (gen !== loadGeneration) return;
+
+    self.postMessage({
+      type: "progress",
+      progress: 96,
+      detail: "Preparing voices…",
+    });
+    self.postMessage({
+      type: "status",
+      message: "Model weights ready — preparing voices…",
+    });
+
+    const voices = await filterVoicesToLocal(tts.voices);
+    if (gen !== loadGeneration) return;
+
+    self.postMessage({
+      type: "ready",
+      voices,
+      device,
+      dtype,
+      source: pick.source,
+      modelKey: activeModelKey,
+      modelId: MODEL_ID,
+      modelLabel: activeModel.label,
+      modelShortLabel: activeModel.shortLabel,
+    });
+  } catch (error) {
+    if (gen !== loadGeneration) return;
+    self.postMessage({
+      type: "error",
+      message:
+        (error?.message || String(error)) +
+        " — Choose a model library folder and Download, or allow Hugging Face access.",
+      modelKey: activeModelKey,
+    });
+  } finally {
+    clearInterval(heartbeat);
+    if (gen === loadGeneration) {
+      loading = false;
+      if (pendingModelKey) {
+        const next = pendingModelKey;
+        pendingModelKey = null;
+        // Avoid tight loop if same key failed repeatedly
+        if (next !== activeModelKey || !tts) {
+          await init(next);
+        }
+      }
+    }
+  }
+}
+
+self.addEventListener("message", async (event) => {
+  const data = event.data || {};
+
+  if (data.type === "set-model-library") {
+    modelLibraryRoot = data.handle || null;
+    return;
+  }
+
+  if (data.type === "load-model") {
+    if (busy) {
+      self.postMessage({
+        type: "error",
+        message: "Finish generating before switching models.",
+      });
+      return;
+    }
+    await init(data.modelKey);
+    return;
+  }
+
+  if (data.type === "generate") {
+    if (!tts) {
+      self.postMessage({ type: "error", message: "Model is not ready yet." });
+      return;
+    }
+    if (busy || loading) {
+      self.postMessage({
+        type: "error",
+        message: loading ? "Model is still loading." : "Already generating speech.",
+      });
+      return;
+    }
+
+    const text = String(data.text || "").trim();
+    const voice = data.voice || "af_heart";
+    const speed = Number(data.speed) || 1;
+
+    if (!text) {
+      self.postMessage({ type: "error", message: "Please enter some text." });
+      return;
+    }
+
+    busy = true;
+    self.postMessage({ type: "status", message: "Generating speech…" });
+
+    try {
+      const blob = await synthesizeToBlob(text, voice, speed);
+      const buffer = await blob.arrayBuffer();
+
+      self.postMessage(
+        {
+          type: "complete",
+          text,
+          voice,
+          speed,
+          mimeType: blob.type || "audio/wav",
+          buffer,
+          modelKey: activeModelKey,
+        },
+        [buffer],
+      );
+    } catch (error) {
+      self.postMessage({
+        type: "error",
+        message: error?.message || String(error),
+      });
+    } finally {
+      busy = false;
+    }
+  }
+});
+
+// Main thread chooses the model (saved preference or default).
+self.postMessage({ type: "worker-ready", models: true });

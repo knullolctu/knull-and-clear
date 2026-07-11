@@ -1,0 +1,21 @@
+{
+  "name": "knull-and-clear",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Knull & Clear — local browser TTS by knull (Kokoro engine). Loud and clear.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "download-model": "node scripts/download-model.mjs",
+    "download-model:fp32": "node scripts/download-model.mjs --fp32",
+    "download-model:english": "node scripts/download-model.mjs --english-only-voices"
+  },
+  "dependencies": {
+    "kokoro-js": "^1.2.1"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}
