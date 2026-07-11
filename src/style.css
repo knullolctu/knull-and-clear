@@ -1000,6 +1000,52 @@ button.linkish:hover {
   margin-top: 1.15rem;
 }
 
+/* Keep Generate / Save always in view above the fold */
+.actions-primary {
+  position: sticky;
+  bottom: 0.75rem;
+  z-index: 8;
+  margin-top: 1rem;
+  margin-bottom: 0.35rem;
+  padding: 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  background: linear-gradient(
+    165deg,
+    rgba(28, 22, 48, 0.96) 0%,
+    rgba(16, 20, 31, 0.98) 100%
+  );
+  box-shadow:
+    0 12px 36px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(14px);
+}
+
+.actions-primary .btn-primary {
+  flex: 1 1 160px;
+  min-height: 48px;
+  font-size: 1rem;
+}
+
+.actions-primary .btn-secondary {
+  flex: 0 1 auto;
+  min-height: 48px;
+}
+
+.composer .status-bar {
+  margin-top: 0.75rem;
+}
+
+.composer .settings {
+  margin-top: 0.85rem;
+}
+
+.composer .text-input {
+  min-height: 7.5rem;
+  max-height: 14rem;
+  resize: vertical;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -1281,6 +1327,18 @@ button.linkish:hover {
 
   .actions .btn {
     width: 100%;
+  }
+
+  .actions-primary {
+    bottom: 0.5rem;
+    gap: 0.5rem;
+  }
+
+  .actions-primary .btn-primary,
+  .actions-primary .btn-secondary,
+  .actions-primary .btn-ghost {
+    width: 100%;
+    flex: 1 1 auto;
   }
 
   .panel {
