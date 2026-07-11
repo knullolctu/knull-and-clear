@@ -723,7 +723,7 @@ function sendModelLibraryToWorker() {
   }
 }
 
-function setSelectedModel(key, { load = false } = {}) {
+async function setSelectedModel(key, { load = false } = {}) {
   const entry = getModelEntry(key);
   selectedModelKey = entry.key;
   els.modelSelect.value = entry.key;
@@ -748,10 +748,22 @@ function setSelectedModel(key, { load = false } = {}) {
     if (!modelLibDirHandle) {
       const details = document.getElementById("save-settings");
       if (details) details.open = true;
+      showSetupModal(
+        "Choose a model library folder first, Download the model, then load it.",
+      );
       setStatus(
         "Choose a model library folder under Storage first (where models are stored locally).",
         "error",
       );
+      return;
+    }
+    // Refresh permission before worker load (needs user gesture)
+    if (!(await ensureDirPermission(modelLibDirHandle))) {
+      setStatus(
+        "Folder permission expired. Click Choose folder… again under Storage.",
+        "error",
+      );
+      openStorageSection();
       return;
     }
     ready = false;
@@ -1383,14 +1395,16 @@ function handleWorkerMessage(event) {
 
   switch (data.type) {
     case "worker-ready": {
-      // Attach library; only load when user explicitly requested a model
+      // Attach library first, then load (order matters for offline path)
       sendModelLibraryToWorker();
       if (pendingWorkerModelKey) {
         const key = pendingWorkerModelKey;
         pendingWorkerModelKey = null;
-        worker?.postMessage({ type: "load-model", modelKey: key });
+        // Brief delay so set-model-library is processed before load-model
+        queueMicrotask(() => {
+          worker?.postMessage({ type: "load-model", modelKey: key });
+        });
       } else {
-        // Idle worker — no auto-load, no overlay
         hideOverlay();
       }
       break;

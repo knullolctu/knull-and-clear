@@ -98,6 +98,7 @@ async function isPackDir(dir) {
  */
 async function resolvePackDir(modelId) {
   if (!modelLibraryRoot) return null;
+  // Only cache positive hits — a prior miss would block finds after Download
   if (packDirCache.has(modelId)) return packDirCache.get(modelId);
 
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
@@ -153,7 +154,6 @@ async function resolvePackDir(modelId) {
         found = dir;
         return;
       }
-      // Keep first pack as weak fallback only if name matches
       return;
     }
     try {
@@ -176,7 +176,7 @@ async function resolvePackDir(modelId) {
   }
 
   await walk(modelLibraryRoot, "", 0);
-  packDirCache.set(modelId, found);
+  if (found) packDirCache.set(modelId, found);
   return found;
 }
 
@@ -491,26 +491,50 @@ self.fetch = (input, init) => {
     })();
   }
 
-  // Same-origin /models/... also prefer user library when set
-  if (modelLibraryRoot) {
-    try {
-      const u = new URL(url, self.location.origin);
-      const m = u.pathname.match(/\/models\/(.+)$/);
-      if (m) {
-        const fullRel = decodeURIComponent(m[1]);
-        return readFromModelLibraryPath(fullRel).then((buf) => {
-          if (buf) {
+  // Same-origin /models/... — always try user library first (site pack may be empty)
+  try {
+    const u = new URL(url, self.location.origin);
+    // Match /models/… or /repo-name/models/…
+    const m = u.pathname.match(/\/models\/(.+)$/);
+    if (m) {
+      const fullRel = decodeURIComponent(m[1]);
+      return (async () => {
+        // 1) User library folder
+        if (modelLibraryRoot) {
+          const buf = await readFromModelLibraryPath(fullRel);
+          if (buf && buf.byteLength > 0) {
             const ct = fullRel.endsWith(".json")
               ? "application/json"
-              : "application/octet-stream";
+              : fullRel.endsWith(".onnx")
+                ? "application/octet-stream"
+                : "application/octet-stream";
             return libraryResponse(buf, ct);
           }
-          return originalFetch(input, init);
-        });
-      }
-    } catch {
-      /* ignore */
+        }
+        // 2) Optional site-hosted public/models
+        try {
+          const res = await originalFetch(input, init);
+          if (res.ok && res.status !== 204) {
+            const type = (res.headers.get("content-type") || "").toLowerCase();
+            // GitHub Pages SPA fallback returns HTML — treat as missing
+            if (!type.includes("text/html") && !type.includes("text/plain")) {
+              return res;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        const where = modelLibraryRoot
+          ? "your model library folder (use Download for this pack)"
+          : "Storage → choose a model library folder, then Download";
+        return new Response(
+          `Offline: missing models/${fullRel}. Set ${where}.`,
+          { status: 404, statusText: "Not Found (local library)" },
+        );
+      })();
     }
+  } catch {
+    /* ignore */
   }
 
   return originalFetch(input, init);
@@ -1163,7 +1187,47 @@ let loading = false;
 let pendingModelKey = null;
 let loadGeneration = 0;
 
+/**
+ * Ensure tokenizer/config exist in library or on site before from_pretrained.
+ */
+async function assertModelFilesPresent() {
+  const needed = ["tokenizer.json", "config.json", "tokenizer_config.json"];
+  const missing = [];
+  for (const f of needed) {
+    let ok = false;
+    if (modelLibraryRoot) {
+      const buf = await readFromModelLibrary(MODEL_ID, f);
+      if (buf && buf.byteLength > 0) ok = true;
+    }
+    if (!ok) {
+      try {
+        const res = await originalFetch(`${MODEL_BASE}${f}`, { method: "HEAD" });
+        const type = (res.headers.get("content-type") || "").toLowerCase();
+        ok =
+          res.ok &&
+          res.status !== 204 &&
+          !type.includes("text/html") &&
+          !type.includes("text/plain");
+      } catch {
+        ok = false;
+      }
+    }
+    if (!ok) missing.push(f);
+  }
+  if (missing.length) {
+    if (!modelLibraryRoot) {
+      throw new Error(
+        `No model library folder set, and site has no /models pack. Open Storage → Choose folder…, Download “${activeModel.shortLabel}”, then select the model again.`,
+      );
+    }
+    throw new Error(
+      `Missing in library for ${MODEL_ID}: ${missing.join(", ")}. Use Download on “${activeModel.shortLabel}” (saves under models/${MODEL_ID}/).`,
+    );
+  }
+}
+
 async function loadModel(device, dtype) {
+  await assertModelFilesPresent();
   // Always pin wasm for speech quality unless webgpu was explicitly chosen.
   const dev = device === "webgpu" ? "webgpu" : "wasm";
   return KokoroTTS.from_pretrained(MODEL_ID, {
@@ -1288,11 +1352,15 @@ async function init(modelKey) {
     });
   } catch (error) {
     if (gen !== loadGeneration) return;
+    const raw = error?.message || String(error);
+    const friendly = /local_files_only|allowRemoteModels|not found locally/i.test(
+      raw,
+    )
+      ? `Model files not in your library for ${MODEL_ID}. Storage → choose folder → Download “${activeModel.shortLabel}”, then select it again. (Site /models is empty; offline library only.)`
+      : raw;
     self.postMessage({
       type: "error",
-      message:
-        (error?.message || String(error)) +
-        " — Offline only: set a model library folder under Storage and Download weights, or ship models under /models/.",
+      message: friendly,
       modelKey: activeModelKey,
     });
   } finally {
