@@ -377,8 +377,8 @@ async function writeToVoiceCache(fileName, buf) {
 }
 
 /**
- * Load a voice once: memory → Cache API → user library → self-hosted /models.
- * Never hits Hugging Face at runtime.
+ * Load a voice once: memory → Cache API → user library only.
+ * Never hits Hugging Face or site /models.
  */
 async function fetchVoiceBuffer(fileName) {
   if (voiceMemory.has(fileName)) return voiceMemory.get(fileName);
@@ -391,7 +391,12 @@ async function fetchVoiceBuffer(fileName) {
       return cached;
     }
 
-    // User model library (custom folder, layout-aware)
+    if (!modelLibraryRoot) {
+      throw new Error(
+        `Voice "${fileName.replace(/\.bin$/, "")}" needs a model library folder. Storage → Choose folder… then Download a model.`,
+      );
+    }
+
     for (const repo of [MODEL_ID, V1_MODEL_ID]) {
       const libBuf = await readFromModelLibrary(repo, `voices/${fileName}`);
       if (libBuf && libBuf.byteLength >= MIN_VOICE_BYTES) {
@@ -401,28 +406,8 @@ async function fetchVoiceBuffer(fileName) {
       }
     }
 
-    // Self-hosted public/models on this origin (Pages / local dev)
-    const localCandidates = [
-      `${MODEL_BASE}voices/${fileName}`,
-      `${V1_VOICES_BASE}voices/${fileName}`,
-    ];
-
-    for (const localUrl of localCandidates) {
-      try {
-        const res = await originalFetch(localUrl);
-        if (!res.ok || res.status === 204) continue;
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength < MIN_VOICE_BYTES) continue;
-        voiceMemory.set(fileName, buf);
-        await writeToVoiceCache(fileName, buf);
-        return buf;
-      } catch {
-        /* try next */
-      }
-    }
-
     throw new Error(
-      `Voice "${fileName.replace(/\.bin$/, "")}" not found in your model library or site models. Pick a library folder (Storage) and Download the model.`,
+      `Voice "${fileName.replace(/\.bin$/, "")}" not in your library. Download the model pack (includes voices/).`,
     );
   })();
 
@@ -455,80 +440,54 @@ self.fetch = (input, init) => {
     return fetchVoiceBuffer(voiceMatch[2]).then((buf) => voiceResponse(buf));
   }
 
-  // Any other HF model file → serve from library or self-hosted /models, never HF
+  // HF model URLs → user library only (never network / never site repo)
   const hfFile = url.match(HF_ANY_FILE_RE);
   if (hfFile) {
     const modelId = hfFile[1];
     const fileRel = hfFile[2];
     return (async () => {
-      let buf = await readFromModelLibrary(modelId, fileRel);
-      if (!buf) {
-        // Self-hosted under /models/{modelId}/...
-        const localUrl = new URL(
-          `models/${modelId}/${fileRel}`,
-          self.location.origin + BASE_URL,
-        ).href;
-        try {
-          const res = await originalFetch(localUrl);
-          if (res.ok && res.status !== 204) {
-            const body = await res.arrayBuffer();
-            if (body.byteLength > 0) buf = body;
-          }
-        } catch {
-          /* ignore */
-        }
+      if (!modelLibraryRoot) {
+        return new Response(
+          "No model library folder. Storage → Choose folder… then Download.",
+          { status: 404, statusText: "Not Found (local only)" },
+        );
       }
-      if (buf) {
+      const buf = await readFromModelLibrary(modelId, fileRel);
+      if (buf && buf.byteLength > 0) {
         const ct = fileRel.endsWith(".json")
           ? "application/json"
           : "application/octet-stream";
         return libraryResponse(buf, ct);
       }
       return new Response(
-        `Offline mode: missing local file ${modelId}/${fileRel}. Choose a model library folder and Download.`,
-        { status: 404, statusText: "Not Found (local only)" },
+        `Missing in library: ${modelId}/${fileRel}. Download this model pack first.`,
+        { status: 404, statusText: "Not Found (local library)" },
       );
     })();
   }
 
-  // Same-origin /models/... — always try user library first (site pack may be empty)
+  // Transformers localModelPath hits same-origin /models/... → serve only from library
   try {
     const u = new URL(url, self.location.origin);
-    // Match /models/… or /repo-name/models/…
     const m = u.pathname.match(/\/models\/(.+)$/);
     if (m) {
       const fullRel = decodeURIComponent(m[1]);
       return (async () => {
-        // 1) User library folder
-        if (modelLibraryRoot) {
-          const buf = await readFromModelLibraryPath(fullRel);
-          if (buf && buf.byteLength > 0) {
-            const ct = fullRel.endsWith(".json")
-              ? "application/json"
-              : fullRel.endsWith(".onnx")
-                ? "application/octet-stream"
-                : "application/octet-stream";
-            return libraryResponse(buf, ct);
-          }
+        if (!modelLibraryRoot) {
+          return new Response(
+            "No model library folder set. Storage → Choose folder…, Download a model, then load it.",
+            { status: 404, statusText: "Not Found (local library)" },
+          );
         }
-        // 2) Optional site-hosted public/models
-        try {
-          const res = await originalFetch(input, init);
-          if (res.ok && res.status !== 204) {
-            const type = (res.headers.get("content-type") || "").toLowerCase();
-            // GitHub Pages SPA fallback returns HTML — treat as missing
-            if (!type.includes("text/html") && !type.includes("text/plain")) {
-              return res;
-            }
-          }
-        } catch {
-          /* ignore */
+        const buf = await readFromModelLibraryPath(fullRel);
+        if (buf && buf.byteLength > 0) {
+          const ct = fullRel.endsWith(".json")
+            ? "application/json"
+            : "application/octet-stream";
+          return libraryResponse(buf, ct);
         }
-        const where = modelLibraryRoot
-          ? "your model library folder (use Download for this pack)"
-          : "Storage → choose a model library folder, then Download";
         return new Response(
-          `Offline: missing models/${fullRel}. Set ${where}.`,
+          `Missing in your library: models/${fullRel}. Use Download on this model.`,
           { status: 404, statusText: "Not Found (local library)" },
         );
       })();
@@ -537,6 +496,7 @@ self.fetch = (input, init) => {
     /* ignore */
   }
 
+  // Non-model requests (wasm CDN, etc.) still use network
   return originalFetch(input, init);
 };
 
@@ -572,32 +532,17 @@ async function purgeBadVoiceCache() {
 async function filterVoicesToLocal(voices) {
   if (!voices || typeof voices !== "object") return voices;
 
-  let selfHosted = false;
+  let inLibrary = false;
   if (modelLibraryRoot) {
     const buf = await readFromModelLibrary(MODEL_ID, "voices/af_heart.bin");
-    if (buf && buf.byteLength >= MIN_VOICE_BYTES) selfHosted = true;
-    if (!selfHosted) {
+    if (buf && buf.byteLength >= MIN_VOICE_BYTES) inLibrary = true;
+    if (!inLibrary) {
       const buf2 = await readFromModelLibrary(V1_MODEL_ID, "voices/af_heart.bin");
-      if (buf2 && buf2.byteLength >= MIN_VOICE_BYTES) selfHosted = true;
-    }
-  }
-  if (!selfHosted) {
-    try {
-      const res = await originalFetch(`${MODEL_BASE}voices/af_heart.bin`, {
-        method: "HEAD",
-      });
-      const type = (res.headers.get("content-type") || "").toLowerCase();
-      selfHosted =
-        res.ok &&
-        res.status === 200 &&
-        !type.includes("text/html") &&
-        !type.includes("text/plain");
-    } catch {
-      selfHosted = false;
+      if (buf2 && buf2.byteLength >= MIN_VOICE_BYTES) inLibrary = true;
     }
   }
 
-  if (!selfHosted) return voices;
+  if (!inLibrary) return voices;
 
   const local = {};
   for (const id of LOCAL_ENGLISH_VOICES) {
@@ -620,11 +565,6 @@ async function detectWebGPU() {
 }
 
 /**
- * True only if url is a real ONNX weight file (not SPA HTML fallback).
- * Vite/GitHub Pages can return 200 + index.html for missing paths, which
- * would otherwise make HEAD checks lie and cause protobuf parse errors.
- */
-/**
  * Infer dtype from onnx filename for size checks.
  * @param {string} urlOrPath
  */
@@ -638,54 +578,18 @@ function dtypeFromOnnxPath(urlOrPath) {
   return "q8";
 }
 
+/** ONNX present only if readable from the user library with a sane size. */
 async function existsOnnx(url) {
-  // Prefer user library when URL maps to /models/{id}/onnx/file
-  if (modelLibraryRoot) {
-    try {
-      const u = new URL(url, self.location.origin);
-      const m = u.pathname.match(/\/models\/(.+)$/);
-      if (m) {
-        const fullRel = decodeURIComponent(m[1]);
-        const buf = await readFromModelLibraryPath(fullRel);
-        if (buf && weightSizeOk(dtypeFromOnnxPath(fullRel), buf.byteLength)) {
-          return true;
-        }
-        // Wrong-sized file must not count as a hit (avoids loading q8 as fp32)
-        if (buf && buf.byteLength >= 1_000_000) return false;
-      }
-    } catch {
-      /* fall through */
-    }
-  }
-
+  if (!modelLibraryRoot) return false;
   try {
-    const res = await originalFetch(url, { method: "HEAD" });
-    if (!res.ok) return false;
-
-    const type = (res.headers.get("content-type") || "").toLowerCase();
-    if (type.includes("text/html") || type.includes("text/plain")) return false;
-
-    const len = Number(res.headers.get("content-length") || 0);
-    // Kokoro weights are tens of MB; index.html is a few KB.
-    if (len > 0 && len < 1_000_000) return false;
-    if (len > 0 && !weightSizeOk(dtypeFromOnnxPath(url), len)) return false;
-
-    // Empty Content-Length + no binary type → verify magic via range GET.
-    if (!len) {
-      const probe = await originalFetch(url, {
-        headers: { Range: "bytes=0-63" },
-      });
-      if (!probe.ok && probe.status !== 206) return false;
-      const probeType = (probe.headers.get("content-type") || "").toLowerCase();
-      if (probeType.includes("text/html")) return false;
-      const buf = new Uint8Array(await probe.arrayBuffer());
-      const head = new TextDecoder().decode(buf).trimStart();
-      if (head.startsWith("<!") || head.startsWith("<html")) return false;
-      // ONNX protobuf often embeds "onnx" near the start
-      if (!head.includes("onnx") && buf.length < 16) return false;
-    }
-
-    return true;
+    const u = new URL(url, self.location.origin);
+    const m = u.pathname.match(/\/models\/(.+)$/);
+    if (!m) return false;
+    const fullRel = decodeURIComponent(m[1]);
+    const buf = await readFromModelLibraryPath(fullRel);
+    return Boolean(
+      buf && weightSizeOk(dtypeFromOnnxPath(fullRel), buf.byteLength),
+    );
   } catch {
     return false;
   }
@@ -712,96 +616,36 @@ function onnxFileForDtype(dtype) {
 }
 
 /**
- * Pick device + dtype for the active catalog entry.
- * Respects user-selected model dtype; falls back if weights are missing.
+ * Pick device + dtype from the user library only (no site/repo packs).
  */
 async function pickRuntime(preferWebGPU) {
+  if (!modelLibraryRoot) {
+    throw new Error(
+      "All models are local-only. Storage → Choose folder…, Download a model, then select it to load.",
+    );
+  }
+
   const wanted = activeModel.dtype || "q8";
   const devicePref = activeModel.devicePref || "auto";
-
-  // Only probe the dtype we need (+ q8 fallback). Avoid extra 404 HEADs.
-  const wantedUrl = `${MODEL_BASE}onnx/${onnxFileForDtype(wanted)}`;
-  const q8Url = `${MODEL_BASE}onnx/model_quantized.onnx`;
-  // Shared self-hosted v1 q8 when the selected HF id has no local mirror
-  const v1Q8Url = `${V1_VOICES_BASE}onnx/model_quantized.onnx`;
 
   const pickDevice = (dtype) => {
     if (devicePref === "wasm") return "wasm";
     if (devicePref === "webgpu") return preferWebGPU ? "webgpu" : "wasm";
-    // Prefer WASM for all dtypes — WebGPU fp32/q4 paths often produce noisy audio
-    // on consumer GPUs with ORT web. fp32 still works on wasm (slower, cleaner).
     if (dtype === "fp32" || dtype === "fp16") {
-      // Only use webgpu when explicitly preferred and available
       return devicePref === "webgpu" && preferWebGPU ? "webgpu" : "wasm";
     }
     return "wasm";
   };
 
-  const hasWanted = await existsOnnx(wantedUrl);
-  if (hasWanted) {
-    return {
-      device: pickDevice(wanted),
-      dtype: wanted,
-      source: `local-${wanted}`,
-    };
-  }
-
-  // Fall back to local q8 on this model id, then shared v1 q8 pack
-  if (wanted !== "q8") {
-    const hasQ8 = await existsOnnx(q8Url);
-    if (hasQ8) {
-      return { device: "wasm", dtype: "q8", source: "local-q8-fallback" };
-    }
-  }
-
-  if (MODEL_ID !== V1_MODEL_ID) {
-    const hasV1Q8 = await existsOnnx(v1Q8Url);
-    if (hasV1Q8) {
-      // Use self-hosted v1 weights instead of remote
-      MODEL_ID = V1_MODEL_ID;
-      MODEL_BASE = V1_VOICES_BASE;
-      return { device: "wasm", dtype: "q8", source: "local-v1-q8" };
-    }
-  } else {
-    const hasQ8 = await existsOnnx(q8Url);
-    if (hasQ8) {
-      return { device: "wasm", dtype: "q8", source: "local-q8" };
-    }
-  }
-
-  // Also probe user library directly for wanted / q8
-  if (modelLibraryRoot) {
-    for (const [dtype, file] of [
-      [wanted, onnxFileForDtype(wanted)],
-      ["q8", "model_quantized.onnx"],
-    ]) {
-      for (const id of [MODEL_ID, V1_MODEL_ID]) {
-        const buf = await readFromModelLibrary(id, `onnx/${file}`);
-        if (buf && weightSizeOk(dtype, buf.byteLength)) {
-          if (id !== MODEL_ID) {
-            MODEL_ID = id;
-            MODEL_BASE = new URL(
-              `models/${id}/`,
-              self.location.origin + BASE_URL,
-            ).pathname.replace(/\/?$/, "/");
-          }
-          return {
-            device: pickDevice(dtype),
-            dtype,
-            source: `library-${dtype}`,
-          };
-        }
-      }
-    }
-  }
-
-  // fp32 requested but missing/invalid — fall back to q8 rather than bad audio
-  if (wanted === "fp32" || wanted === "q4") {
+  // Probe library for wanted dtype, then q8 fallback on same / v1 pack
+  for (const [dtype, file] of [
+    [wanted, onnxFileForDtype(wanted)],
+    ["q8", "model_quantized.onnx"],
+  ]) {
+    if (dtype !== wanted && wanted === "q8") continue;
     for (const id of [MODEL_ID, V1_MODEL_ID]) {
-      const q8buf = modelLibraryRoot
-        ? await readFromModelLibrary(id, "onnx/model_quantized.onnx")
-        : null;
-      if (q8buf && weightSizeOk("q8", q8buf.byteLength)) {
+      const buf = await readFromModelLibrary(id, `onnx/${file}`);
+      if (buf && weightSizeOk(dtype, buf.byteLength)) {
         if (id !== MODEL_ID) {
           MODEL_ID = id;
           MODEL_BASE = new URL(
@@ -810,28 +654,19 @@ async function pickRuntime(preferWebGPU) {
           ).pathname.replace(/\/?$/, "/");
         }
         return {
-          device: "wasm",
-          dtype: "q8",
-          source: `library-q8-fallback-from-${wanted}`,
-        };
-      }
-      if (await existsOnnx(`${new URL(`models/${id}/`, self.location.origin + BASE_URL).pathname.replace(/\/?$/, "/")}onnx/model_quantized.onnx`)) {
-        MODEL_ID = id;
-        MODEL_BASE = new URL(
-          `models/${id}/`,
-          self.location.origin + BASE_URL,
-        ).pathname.replace(/\/?$/, "/");
-        return {
-          device: "wasm",
-          dtype: "q8",
-          source: `local-q8-fallback-from-${wanted}`,
+          device: pickDevice(dtype),
+          dtype,
+          source:
+            dtype === wanted
+              ? `library-${dtype}`
+              : `library-q8-fallback-from-${wanted}`,
         };
       }
     }
   }
 
   throw new Error(
-    "No local model weights found. Open Storage → choose a model library folder, Download Balanced (q8) or High quality (fp32 model.onnx ~310MB), then load again.",
+    `No weights in your library for ${activeModel.shortLabel}. Download it first (saves under models/${MODEL_ID}/onnx/).`,
   );
 }
 
@@ -1188,40 +1023,23 @@ let pendingModelKey = null;
 let loadGeneration = 0;
 
 /**
- * Ensure tokenizer/config exist in library or on site before from_pretrained.
+ * Ensure tokenizer/config exist in the user library before from_pretrained.
  */
 async function assertModelFilesPresent() {
+  if (!modelLibraryRoot) {
+    throw new Error(
+      `All models are local-only. Storage → Choose folder…, Download “${activeModel.shortLabel}”, then select it again.`,
+    );
+  }
   const needed = ["tokenizer.json", "config.json", "tokenizer_config.json"];
   const missing = [];
   for (const f of needed) {
-    let ok = false;
-    if (modelLibraryRoot) {
-      const buf = await readFromModelLibrary(MODEL_ID, f);
-      if (buf && buf.byteLength > 0) ok = true;
-    }
-    if (!ok) {
-      try {
-        const res = await originalFetch(`${MODEL_BASE}${f}`, { method: "HEAD" });
-        const type = (res.headers.get("content-type") || "").toLowerCase();
-        ok =
-          res.ok &&
-          res.status !== 204 &&
-          !type.includes("text/html") &&
-          !type.includes("text/plain");
-      } catch {
-        ok = false;
-      }
-    }
-    if (!ok) missing.push(f);
+    const buf = await readFromModelLibrary(MODEL_ID, f);
+    if (!buf || buf.byteLength === 0) missing.push(f);
   }
   if (missing.length) {
-    if (!modelLibraryRoot) {
-      throw new Error(
-        `No model library folder set, and site has no /models pack. Open Storage → Choose folder…, Download “${activeModel.shortLabel}”, then select the model again.`,
-      );
-    }
     throw new Error(
-      `Missing in library for ${MODEL_ID}: ${missing.join(", ")}. Use Download on “${activeModel.shortLabel}” (saves under models/${MODEL_ID}/).`,
+      `Missing in your library for ${MODEL_ID}: ${missing.join(", ")}. Download “${activeModel.shortLabel}” first.`,
     );
   }
 }
@@ -1282,10 +1100,8 @@ async function init(modelKey) {
     let { device, dtype } = pick;
 
     const sourceLabel = pick.source.startsWith("library")
-      ? `model library (${pick.source})`
-      : pick.source.startsWith("local")
-        ? `site models (${pick.source})`
-        : pick.source;
+      ? `local library (${pick.dtype || pick.source})`
+      : pick.source;
 
     self.postMessage({
       type: "status",
@@ -1356,7 +1172,7 @@ async function init(modelKey) {
     const friendly = /local_files_only|allowRemoteModels|not found locally/i.test(
       raw,
     )
-      ? `Model files not in your library for ${MODEL_ID}. Storage → choose folder → Download “${activeModel.shortLabel}”, then select it again. (Site /models is empty; offline library only.)`
+      ? `Files missing in your local library for ${MODEL_ID}. Storage → folder → Download “${activeModel.shortLabel}”, then load again. (No models from the website/repo.)`
       : raw;
     self.postMessage({
       type: "error",

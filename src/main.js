@@ -7,7 +7,6 @@ import {
   DEFAULT_MODEL_KEY,
   getModelEntry,
   listModelsForUi,
-  localOnnxPublicPath,
 } from "./modelCatalog.js";
 import {
   downloadEntryFiles,
@@ -295,33 +294,15 @@ function closeModelMenu() {
 }
 
 /**
- * True if weights exist in the user model library folder, or under public/models (local dev).
+ * True if weights exist in the user-chosen local library folder only.
  * @param {import("./modelCatalog.js").ModelEntry | { key: string }} entry
  */
 async function isModelDownloaded(entry) {
   const full = getModelEntry(entry.key || entry);
-
-  // Preferred: user-chosen library folder ({root}/models/{modelId}/…)
-  if (modelLibDirHandle) {
-    const ok = await ensureDirPermission(modelLibDirHandle);
-    if (ok && (await isEntryInLibrary(modelLibDirHandle, full))) {
-      return true;
-    }
-  }
-
-  // Self-hosted site models under public/models (offline origin only)
-  const path = localOnnxPublicPath(full, import.meta.env.BASE_URL || "/");
-  try {
-    const res = await fetch(path, { method: "HEAD" });
-    if (!res.ok || res.status === 204) return false;
-    const type = (res.headers.get("content-type") || "").toLowerCase();
-    if (type.includes("text/html") || type.includes("text/plain")) return false;
-    const len = Number(res.headers.get("content-length") || 0);
-    if (len > 0 && len < 1_000_000) return false;
-    return true;
-  } catch {
-    return false;
-  }
+  if (!modelLibDirHandle) return false;
+  const ok = await ensureDirPermission(modelLibDirHandle);
+  if (!ok) return false;
+  return isEntryInLibrary(modelLibDirHandle, full);
 }
 
 /** @type {Map<string, boolean>} */
@@ -847,7 +828,7 @@ function populateModelMenu() {
     dlBtn.type = "button";
     dlBtn.className = "btn btn-secondary btn-sm model-download-btn";
     dlBtn.textContent = "Download";
-    dlBtn.title = "Save this model under public/models for offline use";
+    dlBtn.title = "Download into your local model library folder";
     // Hidden until status is known; stays hidden if already on disk
     dlBtn.hidden = true;
     dlBtn.addEventListener("click", (e) => {
@@ -1455,13 +1436,11 @@ function handleWorkerMessage(event) {
       if (data.device) {
         const dtype = data.dtype ? ` · ${data.dtype}` : "";
         const srcRaw = String(data.source || "");
-        const src = srcRaw.startsWith("library")
-          ? " · model library"
-          : srcRaw.startsWith("local")
-            ? " · site models"
-            : srcRaw
-              ? ` · ${srcRaw}`
-              : "";
+        const src = srcRaw
+          ? srcRaw.startsWith("library")
+            ? " · local library"
+            : ` · ${srcRaw}`
+          : "";
         const modelBit = data.modelShortLabel
           ? ` · ${data.modelShortLabel}`
           : "";
