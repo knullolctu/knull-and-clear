@@ -1,10 +1,16 @@
 /**
  * User-chosen local model library (File System Access API).
  *
- * Fixed structure (same idea as site /models/):
+ * Write path (always fixed):
  *   {libraryRoot}/models/{modelId}/config.json
- *   {libraryRoot}/models/{modelId}/onnx/model_quantized.onnx
- *   {libraryRoot}/models/{modelId}/voices/*.bin
+ *   {libraryRoot}/models/{modelId}/onnx/…
+ *   {libraryRoot}/models/{modelId}/voices/…
+ *
+ * Read path auto-scans nested folders so any of these work:
+ *   {root}/models/{modelId}/…
+ *   {root}/{modelId}/…
+ *   {root}/…/models/{modelId}/…  (nested parents)
+ *   pack folder found by name match deeper in the tree
  */
 
 import {
@@ -15,17 +21,44 @@ import {
   onnxFileForDtype,
 } from "./modelCatalog.js";
 
-/** Prefix under the user-chosen folder — always "models". */
+/** Preferred write prefix under the user-chosen folder. */
 export const LIBRARY_MODELS_PREFIX = "models";
 
+/** Max depth when scanning for nested packs. */
+const MAX_SCAN_DEPTH = 8;
+
 /**
- * Path under library root for a file in a model pack.
- * @param {string} modelId e.g. onnx-community/Kokoro-82M-v1.0-ONNX
- * @param {string} fileRel e.g. onnx/model_quantized.onnx
+ * Preferred write path under library root.
+ * @param {string} modelId
+ * @param {string} fileRel
  */
 export function pathInLibrary(modelId, fileRel) {
   const file = String(fileRel || "").replace(/^\/+/, "");
   return `${LIBRARY_MODELS_PREFIX}/${modelId}/${file}`.replace(/\/+/g, "/");
+}
+
+/**
+ * Candidate relative paths for reading a model file (canonical first).
+ * @param {string} modelId
+ * @param {string} fileRel
+ */
+export function readPathCandidates(modelId, fileRel) {
+  const file = String(fileRel || "").replace(/^\/+/, "");
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const short = id.split("/").filter(Boolean).pop() || id;
+  /** @type {string[]} */
+  const out = [
+    `${LIBRARY_MODELS_PREFIX}/${id}/${file}`,
+    `${id}/${file}`,
+    // User selected the `models` folder itself
+    `${id.split("/").slice(1).join("/")}/${file}`,
+    // Pack dir only named by last segment
+    `${LIBRARY_MODELS_PREFIX}/${short}/${file}`,
+    `${short}/${file}`,
+    file, // flat: root is the pack
+  ];
+  // De-dupe
+  return [...new Set(out.map((p) => p.replace(/\/+/g, "/").replace(/^\/+/, "")))];
 }
 
 /**
@@ -78,7 +111,7 @@ export async function libraryFileSize(root, relativePath) {
 /**
  * @param {FileSystemDirectoryHandle} dir
  */
-async function isModelPackDir(dir) {
+export async function isModelPackDir(dir) {
   try {
     await dir.getFileHandle("config.json");
   } catch {
@@ -96,49 +129,173 @@ async function isModelPackDir(dir) {
 }
 
 /**
- * List model ids found under {root}/models/...
+ * Walk nested directories; collect packs as { path, handle }.
+ * path is relative to root ("" if root itself is a pack).
+ * @param {FileSystemDirectoryHandle} root
+ * @param {number} [maxDepth]
+ */
+export async function findNestedModelPacks(root, maxDepth = MAX_SCAN_DEPTH) {
+  /** @type {{ path: string, handle: FileSystemDirectoryHandle, name: string }[]} */
+  const found = [];
+
+  /**
+   * @param {FileSystemDirectoryHandle} dir
+   * @param {string} rel
+   * @param {number} depth
+   */
+  async function walk(dir, rel, depth) {
+    if (depth > maxDepth) return;
+
+    if (await isModelPackDir(dir)) {
+      const name = rel ? rel.split("/").pop() || rel : dir.name;
+      found.push({ path: rel, handle: dir, name });
+      // Still scan children? Usually packs aren't nested in packs — stop.
+      return;
+    }
+
+    try {
+      for await (const [name, handle] of dir.entries()) {
+        if (handle.kind !== "directory") continue;
+        // Skip junk
+        if (
+          name === "node_modules" ||
+          name === ".git" ||
+          name === "dist" ||
+          name.startsWith(".")
+        ) {
+          continue;
+        }
+        const childRel = rel ? `${rel}/${name}` : name;
+        await walk(handle, childRel, depth + 1);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  await walk(root, "", 0);
+  return found;
+}
+
+/**
+ * Resolve directory handle for a catalog modelId by scanning nested folders.
+ * @param {FileSystemDirectoryHandle} root
+ * @param {string} modelId
+ * @returns {Promise<FileSystemDirectoryHandle | null>}
+ */
+export async function resolveModelPackDir(root, modelId) {
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const segments = id.split("/").filter(Boolean);
+  const short = segments[segments.length - 1] || id;
+
+  // Fast path: fixed write locations
+  const directPaths = [
+    `${LIBRARY_MODELS_PREFIX}/${id}`,
+    id,
+    short,
+    `${LIBRARY_MODELS_PREFIX}/${short}`,
+  ];
+  for (const rel of directPaths) {
+    try {
+      const parts = rel.split("/").filter(Boolean);
+      let dir = root;
+      for (const p of parts) dir = await dir.getDirectoryHandle(p);
+      if (await isModelPackDir(dir)) return dir;
+    } catch {
+      /* try next */
+    }
+  }
+
+  // Nested scan: match full path ending or folder name
+  const packs = await findNestedModelPacks(root);
+  // Prefer path ending with full modelId
+  for (const p of packs) {
+    if (p.path === id || p.path.endsWith(`/${id}`) || p.path.endsWith(id)) {
+      return p.handle;
+    }
+  }
+  // Path contains org/name segments in order
+  for (const p of packs) {
+    if (segments.length >= 2) {
+      const needle = segments.join("/");
+      if (p.path.includes(needle)) return p.handle;
+    }
+  }
+  // Name match (last segment)
+  for (const p of packs) {
+    if (p.name === short) return p.handle;
+  }
+  return null;
+}
+
+/**
+ * Read a file for modelId, auto-reading nested pack locations.
+ * @param {FileSystemDirectoryHandle} root
+ * @param {string} modelId
+ * @param {string} fileRel
+ * @returns {Promise<ArrayBuffer | null>}
+ */
+export async function readLibraryModelFile(root, modelId, fileRel) {
+  const file = String(fileRel || "").replace(/^\/+/, "");
+
+  // Try known relative paths first
+  for (const rel of readPathCandidates(modelId, file)) {
+    try {
+      const fh = await resolveFileHandle(root, rel, { create: false });
+      const f = await fh.getFile();
+      if (f.size > 0) return await f.arrayBuffer();
+    } catch {
+      /* next */
+    }
+  }
+
+  // Nested pack resolution
+  const pack = await resolveModelPackDir(root, modelId);
+  if (!pack) return null;
+  try {
+    const parts = file.split("/").filter(Boolean);
+    let dir = pack;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i]);
+    }
+    const fh = await dir.getFileHandle(parts[parts.length - 1]);
+    const f = await fh.getFile();
+    if (!f.size) return null;
+    return await f.arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List model ids found anywhere under root (nested).
  * @param {FileSystemDirectoryHandle} root
  */
 export async function listLibraryModelIds(root) {
   /** @type {string[]} */
   const modelIds = [];
-  let modelsDir;
-  try {
-    modelsDir = await root.getDirectoryHandle(LIBRARY_MODELS_PREFIX);
-  } catch {
-    return modelIds;
-  }
+  const packs = await findNestedModelPacks(root);
 
-  // Known catalog packs first
+  // Map packs to catalog modelIds when possible
   for (const entry of MODEL_CATALOG) {
-    const rel = pathInLibrary(entry.modelId, "config.json");
-    if (await libraryFileExists(root, rel)) {
-      if (!modelIds.includes(entry.modelId)) modelIds.push(entry.modelId);
-    }
+    const pack = await resolveModelPackDir(root, entry.modelId);
+    if (pack && !modelIds.includes(entry.modelId)) modelIds.push(entry.modelId);
   }
 
-  // Generic scan: models/{org}/{name}/
-  try {
-    for await (const [orgName, orgHandle] of modelsDir.entries()) {
-      if (orgHandle.kind !== "directory") continue;
-      if (await isModelPackDir(orgHandle)) {
-        if (!modelIds.includes(orgName)) modelIds.push(orgName);
-        continue;
-      }
-      try {
-        for await (const [packName, packHandle] of orgHandle.entries()) {
-          if (packHandle.kind !== "directory") continue;
-          if (await isModelPackDir(packHandle)) {
-            const id = `${orgName}/${packName}`;
-            if (!modelIds.includes(id)) modelIds.push(id);
-          }
-        }
-      } catch {
-        /* ignore */
-      }
+  for (const p of packs) {
+    // Prefer full path if it looks like org/name
+    let id = p.path || p.name;
+    // Strip leading "models/"
+    if (id.startsWith(`${LIBRARY_MODELS_PREFIX}/`)) {
+      id = id.slice(LIBRARY_MODELS_PREFIX.length + 1);
     }
-  } catch {
-    /* ignore */
+    if (id && !modelIds.includes(id)) {
+      // Only add if not already covered by a catalog id that ends the same
+      const covered = modelIds.some(
+        (m) => m === id || m.endsWith(`/${p.name}`) || m.endsWith(p.name),
+      );
+      if (!covered) modelIds.push(id);
+    }
   }
 
   return modelIds;
@@ -150,22 +307,20 @@ export async function listLibraryModelIds(root) {
  */
 export async function isEntryInLibrary(root, entry) {
   const onnx = onnxFileForDtype(entry.dtype);
-  const candidates = [
-    pathInLibrary(entry.modelId, `onnx/${onnx}`),
-    pathInLibrary(entry.modelId, "onnx/model_quantized.onnx"),
-  ];
-  for (const rel of candidates) {
-    const size = await libraryFileSize(root, rel);
-    if (size >= 1_000_000) return true;
+  const files = [`onnx/${onnx}`, "onnx/model_quantized.onnx"];
+  for (const f of files) {
+    const buf = await readLibraryModelFile(root, entry.modelId, f);
+    if (buf && buf.byteLength >= 1_000_000) return true;
   }
   return false;
 }
 
 /**
- * Scan library for catalog models under fixed /models structure.
+ * Scan library for catalog models (nested-aware).
  * @param {FileSystemDirectoryHandle} root
  */
 export async function scanLibraryCatalog(root) {
+  const packs = await findNestedModelPacks(root);
   const modelIds = await listLibraryModelIds(root);
   /** @type {{ key: string, shortLabel: string, present: boolean, onnx?: string }[]} */
   const models = [];
@@ -180,21 +335,23 @@ export async function scanLibraryCatalog(root) {
   }
 
   let voiceSampleCount = 0;
-  const probeIds = modelIds.length
-    ? modelIds
-    : MODEL_CATALOG.map((m) => m.modelId);
-  for (const id of probeIds) {
-    for (const v of ENGLISH_VOICES.slice(0, 8)) {
-      if (await libraryFileExists(root, pathInLibrary(id, `voices/${v}.bin`))) {
-        voiceSampleCount++;
-      }
+  for (const entry of MODEL_CATALOG) {
+    if (!(await isEntryInLibrary(root, entry))) continue;
+    for (const v of ENGLISH_VOICES.slice(0, 6)) {
+      const buf = await readLibraryModelFile(
+        root,
+        entry.modelId,
+        `voices/${v}.bin`,
+      );
+      if (buf && buf.byteLength > 0) voiceSampleCount++;
     }
-    if (voiceSampleCount) break;
+    break;
   }
 
   return {
-    layout: "models",
+    layout: "models+nested",
     modelIds,
+    packPaths: packs.map((p) => p.path || "(root pack)"),
     models,
     presentCount: models.filter((m) => m.present).length,
     voiceSampleCount,
@@ -214,15 +371,13 @@ export async function writeLibraryFile(root, relativePath, data) {
 }
 
 /**
- * Download catalog model files into {root}/models/{modelId}/…
- * (Install only — runtime stays offline.)
+ * Download into fixed {root}/models/{modelId}/… (creates nested folders).
  *
  * @param {object} opts
  * @param {string} opts.modelKey
  * @param {FileSystemDirectoryHandle} [opts.libraryRoot]
  * @param {boolean} [opts.returnBuffers=false]
  * @param {(ev: object) => void} [opts.onProgress]
- * @returns {Promise<{ path: string, data: ArrayBuffer }[]>}
  */
 export async function downloadEntryFiles({
   modelKey,
@@ -247,26 +402,20 @@ export async function downloadEntryFiles({
       ? pathInLibrary(modelId, rel)
       : `${LIBRARY_MODELS_PREFIX}/${modelId}/${rel}`;
 
-    if (libraryRoot && (await libraryFileExists(libraryRoot, dest))) {
-      onProgress?.({
-        type: "skip",
-        file: rel,
-        message: `Skip ${rel} (already present)`,
-        index: i + 1,
-        count: files.length,
-      });
-      if (returnBuffers) {
-        try {
-          const fh = await resolveFileHandle(libraryRoot, dest, {
-            create: false,
-          });
-          const file = await fh.getFile();
-          collected.push({ path: rel, data: await file.arrayBuffer() });
-        } catch {
-          /* ignore */
-        }
+    // Skip if already present at write path OR any nested read location
+    if (libraryRoot) {
+      const existing = await readLibraryModelFile(libraryRoot, modelId, rel);
+      if (existing && existing.byteLength > 0) {
+        onProgress?.({
+          type: "skip",
+          file: rel,
+          message: `Skip ${rel} (already present)`,
+          index: i + 1,
+          count: files.length,
+        });
+        if (returnBuffers) collected.push({ path: rel, data: existing });
+        continue;
       }
-      continue;
     }
 
     const url = `https://huggingface.co/${modelId}/resolve/main/${rel}`;

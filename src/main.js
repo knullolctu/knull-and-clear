@@ -579,7 +579,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = false;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        `Downloads go to “${modelLibDirHandle.name}/models/{model-id}/…”. Offline only.`;
+        `Downloads → “${modelLibDirHandle.name}/models/…”. Auto-reads nested packs under this folder.`;
     }
   } else {
     els.modelLibLabel.textContent = "Not set — pick a folder for /models";
@@ -588,7 +588,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = true;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Chrome / Edge: choose a root folder. Models always use {folder}/models/{model-id}/onnx/…";
+        "Chrome / Edge: choose a root folder. Writes {folder}/models/{model-id}/… and scans nested folders automatically.";
     }
     if (els.modelLibScan) {
       els.modelLibScan.hidden = true;
@@ -615,12 +615,12 @@ async function refreshModelLibScan() {
     const present = scan.models.filter((m) => m.present).map((m) => m.shortLabel);
     const missing = scan.models.filter((m) => !m.present).map((m) => m.shortLabel);
     const lines = [
-      `Structure: ${modelLibDirHandle.name}/models/…`,
+      `Root: ${modelLibDirHandle.name}/ (auto-reads nested models/)`,
       present.length
         ? `Found: ${present.join(", ")}`
         : "Found: (none yet — use Download)",
-      scan.modelIds?.length
-        ? `Packs: ${scan.modelIds.slice(0, 6).join(", ")}${scan.modelIds.length > 6 ? "…" : ""}`
+      scan.packPaths?.length
+        ? `Nested packs: ${scan.packPaths.slice(0, 8).join(", ")}${scan.packPaths.length > 8 ? "…" : ""}`
         : null,
       missing.length ? `Missing: ${missing.join(", ")}` : null,
     ].filter(Boolean);

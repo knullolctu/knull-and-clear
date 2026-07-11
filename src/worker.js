@@ -52,8 +52,10 @@ function configureOrtWasm() {
 /** @type {FileSystemDirectoryHandle | null} */
 let modelLibraryRoot = null;
 
+/** Cache: modelId → pack directory handle (nested scan result) */
+const packDirCache = new Map();
+
 /**
- * Fixed library layout: {root}/models/{modelId}/{fileRel}
  * @param {string} relativePath path under library root
  */
 async function readLibraryAbsolute(relativePath) {
@@ -74,31 +76,176 @@ async function readLibraryAbsolute(relativePath) {
 }
 
 /**
- * Read a model file from the user library (always under models/).
- * @param {string} modelId e.g. onnx-community/Kokoro-82M-v1.0-ONNX
- * @param {string} fileRel e.g. onnx/model_quantized.onnx or voices/af_heart.bin
+ * @param {FileSystemDirectoryHandle} dir
+ */
+async function isPackDir(dir) {
+  try {
+    await dir.getFileHandle("config.json");
+    const onnx = await dir.getDirectoryHandle("onnx");
+    for await (const [name, h] of onnx.entries()) {
+      if (h.kind === "file" && name.endsWith(".onnx")) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Find pack dir for modelId under nested folders (cached).
+ * @param {string} modelId
+ * @returns {Promise<FileSystemDirectoryHandle | null>}
+ */
+async function resolvePackDir(modelId) {
+  if (!modelLibraryRoot) return null;
+  if (packDirCache.has(modelId)) return packDirCache.get(modelId);
+
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const segments = id.split("/").filter(Boolean);
+  const short = segments[segments.length - 1] || id;
+
+  const tryRel = async (rel) => {
+    try {
+      const parts = rel.split("/").filter(Boolean);
+      let dir = modelLibraryRoot;
+      for (const p of parts) dir = await dir.getDirectoryHandle(p);
+      if (await isPackDir(dir)) return dir;
+    } catch {
+      /* miss */
+    }
+    return null;
+  };
+
+  for (const rel of [
+    `models/${id}`,
+    id,
+    `models/${short}`,
+    short,
+  ]) {
+    const hit = await tryRel(rel);
+    if (hit) {
+      packDirCache.set(modelId, hit);
+      return hit;
+    }
+  }
+
+  // Nested walk (depth-limited)
+  const maxDepth = 8;
+  /** @type {FileSystemDirectoryHandle | null} */
+  let found = null;
+
+  /**
+   * @param {FileSystemDirectoryHandle} dir
+   * @param {string} rel
+   * @param {number} depth
+   */
+  async function walk(dir, rel, depth) {
+    if (found || depth > maxDepth) return;
+    if (await isPackDir(dir)) {
+      const name = rel ? rel.split("/").pop() : dir.name;
+      if (
+        rel === id ||
+        rel.endsWith(`/${id}`) ||
+        rel.endsWith(id) ||
+        rel.includes(id) ||
+        name === short
+      ) {
+        found = dir;
+        return;
+      }
+      // Keep first pack as weak fallback only if name matches
+      return;
+    }
+    try {
+      for await (const [name, handle] of dir.entries()) {
+        if (handle.kind !== "directory") continue;
+        if (
+          name === "node_modules" ||
+          name === ".git" ||
+          name === "dist" ||
+          name.startsWith(".")
+        ) {
+          continue;
+        }
+        await walk(handle, rel ? `${rel}/${name}` : name, depth + 1);
+        if (found) return;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  await walk(modelLibraryRoot, "", 0);
+  packDirCache.set(modelId, found);
+  return found;
+}
+
+/**
+ * Read from library: fixed models/ path, then nested auto-scan.
+ * @param {string} modelId
+ * @param {string} fileRel
  */
 async function readFromModelLibrary(modelId, fileRel) {
   if (!modelLibraryRoot) return null;
   const file = String(fileRel || "").replace(/^\/+/, "");
-  const rel = `models/${modelId}/${file}`.replace(/\/+/g, "/");
-  return readLibraryAbsolute(rel);
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const short = id.split("/").pop() || id;
+
+  for (const rel of [
+    `models/${id}/${file}`,
+    `${id}/${file}`,
+    `models/${short}/${file}`,
+    `${short}/${file}`,
+  ]) {
+    const buf = await readLibraryAbsolute(rel.replace(/\/+/g, "/"));
+    if (buf) return buf;
+  }
+
+  const pack = await resolvePackDir(modelId);
+  if (!pack) return null;
+  try {
+    const parts = file.split("/").filter(Boolean);
+    let dir = pack;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = await dir.getDirectoryHandle(parts[i]);
+    }
+    const fh = await dir.getFileHandle(parts[parts.length - 1]);
+    const f = await fh.getFile();
+    if (!f.size) return null;
+    return await f.arrayBuffer();
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Path from site URL /models/{modelId}/… → library models/{modelId}/…
+ * Path from site URL /models/{modelId}/… → library (nested-aware)
  * @param {string} fullRel e.g. onnx-community/…/onnx/file.onnx
  */
 async function readFromModelLibraryPath(fullRel) {
   if (!modelLibraryRoot || !fullRel) return null;
-  const cleaned = String(fullRel).replace(/^\/+/, "");
-  // Prefer fixed prefix models/
-  let buf = await readLibraryAbsolute(
-    cleaned.startsWith("models/") ? cleaned : `models/${cleaned}`,
+  let cleaned = String(fullRel).replace(/^\/+/, "");
+  if (cleaned.startsWith("models/")) cleaned = cleaned.slice("models/".length);
+
+  const parts = cleaned.split("/").filter(Boolean);
+  const onnxIdx = parts.indexOf("onnx");
+  const voicesIdx = parts.indexOf("voices");
+  const cut = onnxIdx >= 0 ? onnxIdx : voicesIdx >= 0 ? voicesIdx : -1;
+  if (cut > 0) {
+    const modelId = parts.slice(0, cut).join("/");
+    const fileRel = parts.slice(cut).join("/");
+    return readFromModelLibrary(modelId, fileRel);
+  }
+  if (parts.length >= 2) {
+    const fileRel = parts[parts.length - 1];
+    const modelId = parts.slice(0, -1).join("/");
+    const buf = await readFromModelLibrary(modelId, fileRel);
+    if (buf) return buf;
+  }
+  return (
+    (await readLibraryAbsolute(`models/${cleaned}`)) ||
+    (await readLibraryAbsolute(cleaned))
   );
-  if (buf) return buf;
-  // Also try as models/{modelId}/{file} if path already includes model id
-  return null;
 }
 
 function libraryResponse(buf, contentType = "application/octet-stream") {
@@ -911,6 +1058,7 @@ self.addEventListener("message", async (event) => {
 
   if (data.type === "set-model-library") {
     modelLibraryRoot = data.handle || null;
+    packDirCache.clear();
     return;
   }
 
