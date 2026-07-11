@@ -202,20 +202,35 @@
               <span class="settings-summary-hint">models · audio · prefix</span>
             </summary>
             <div class="settings-body">
-              <div class="control">
-                <span class="field-label">Model library folder</span>
+              <div class="control model-lib-control">
+                <span class="field-label">Model library folder (offline)</span>
                 <div class="folder-row">
-                  <span id="model-lib-label" class="folder-label">Not set (use web / Hugging Face)</span>
+                  <span id="model-lib-label" class="folder-label">Not set — pick a folder with model packs</span>
                   <button id="pick-model-lib-btn" class="btn btn-secondary btn-sm" type="button">
                     Choose folder…
+                  </button>
+                  <button id="rescan-model-lib-btn" class="btn btn-ghost btn-sm" type="button" hidden>
+                    Rescan
                   </button>
                   <button id="clear-model-lib-btn" class="btn btn-ghost btn-sm" type="button" hidden>
                     Clear
                   </button>
                 </div>
+                <div class="settings-grid model-lib-layout-grid">
+                  <div class="control">
+                    <label class="field-label" for="model-lib-layout">Folder layout</label>
+                    <select id="model-lib-layout" class="text-input text-input-sm">
+                      <option value="auto">Auto-detect</option>
+                      <option value="nested">Nested · {folder}/{model-id}/onnx/…</option>
+                      <option value="flat">Flat · this folder is one pack (onnx/ + config)</option>
+                      <option value="public-models">public/models · onnx-community/…</option>
+                    </select>
+                  </div>
+                </div>
                 <p class="hint" id="model-lib-hint">
-                  Chrome / Edge: pick a folder on your PC for TTS weights (optional if GitHub save is on).
+                  Chrome / Edge: pick where weights live. Runtime is offline-only (no Hugging Face loads).
                 </p>
+                <p class="hint model-lib-scan" id="model-lib-scan" hidden></p>
               </div>
               <div class="control github-models-control">
                 <label class="check-card" for="github-save-enabled">

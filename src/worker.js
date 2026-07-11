@@ -20,11 +20,10 @@ const V1_VOICES_BASE = new URL(
   self.location.origin + BASE_URL,
 ).pathname.replace(/\/?$/, "/");
 
-// Prefer self-hosted model + voices (GitHub Pages / local public/models)
+// Local / self-hosted only — never load weights from Hugging Face at runtime
 env.allowLocalModels = true;
 env.localModelPath = LOCAL_MODEL_PATH;
-// Still allow HF as a fallback if local files are missing during dev
-env.allowRemoteModels = true;
+env.allowRemoteModels = false;
 // Corrupt / partial Cache API entries are a common cause of loads that stall
 // after tokenizer files with no further progress. Prefer re-reading local files.
 env.useBrowserCache = false;
@@ -52,12 +51,15 @@ function configureOrtWasm() {
 
 /** @type {FileSystemDirectoryHandle | null} */
 let modelLibraryRoot = null;
+/** @type {"auto"|"nested"|"flat"|"public-models"} */
+let modelLibraryLayout = "auto";
+/** Resolved after first read when layout is auto */
+let modelLibraryLayoutResolved = null;
 
 /**
- * Read a file from the user model library: {root}/{modelId}/...
- * @param {string} relativePath e.g. onnx-community/Kokoro-…/onnx/model_quantized.onnx
+ * @param {string} relativePath path under library root
  */
-async function readFromModelLibrary(relativePath) {
+async function readLibraryAbsolute(relativePath) {
   if (!modelLibraryRoot) return null;
   try {
     const parts = relativePath.split("/").filter(Boolean);
@@ -72,6 +74,106 @@ async function readFromModelLibrary(relativePath) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Probe which layout the library uses (cached).
+ */
+async function getResolvedLibraryLayout() {
+  if (!modelLibraryRoot) return "nested";
+  if (modelLibraryLayout !== "auto") return modelLibraryLayout;
+  if (modelLibraryLayoutResolved) return modelLibraryLayoutResolved;
+
+  // Flat pack?
+  try {
+    await modelLibraryRoot.getFileHandle("config.json");
+    const onnx = await modelLibraryRoot.getDirectoryHandle("onnx");
+    let hasOnnx = false;
+    for await (const [name, h] of onnx.entries()) {
+      if (h.kind === "file" && name.endsWith(".onnx")) {
+        hasOnnx = true;
+        break;
+      }
+    }
+    if (hasOnnx) {
+      modelLibraryLayoutResolved = "flat";
+      return "flat";
+    }
+  } catch {
+    /* not flat */
+  }
+
+  // public-models?
+  try {
+    await modelLibraryRoot.getDirectoryHandle("onnx-community");
+    modelLibraryLayoutResolved = "public-models";
+    return "public-models";
+  } catch {
+    /* nested default */
+  }
+
+  modelLibraryLayoutResolved = "nested";
+  return "nested";
+}
+
+/**
+ * Read a model file from the user library using layout-aware candidates.
+ * @param {string} modelId e.g. onnx-community/Kokoro-82M-v1.0-ONNX
+ * @param {string} fileRel e.g. onnx/model_quantized.onnx or voices/af_heart.bin
+ */
+async function readFromModelLibrary(modelId, fileRel) {
+  if (!modelLibraryRoot) return null;
+  const layout = await getResolvedLibraryLayout();
+  const file = String(fileRel || "").replace(/^\/+/, "");
+  /** @type {string[]} */
+  const candidates = [];
+
+  if (layout === "flat") {
+    candidates.push(file);
+  } else {
+    candidates.push(`${modelId}/${file}`);
+    // If user nested only the last segment
+    const short = modelId.split("/").pop();
+    if (short) candidates.push(`${short}/${file}`);
+  }
+  // Always try alternate layouts as fallback
+  candidates.push(file);
+  candidates.push(`${modelId}/${file}`);
+
+  const seen = new Set();
+  for (const rel of candidates) {
+    if (!rel || seen.has(rel)) continue;
+    seen.add(rel);
+    const buf = await readLibraryAbsolute(rel);
+    if (buf) return buf;
+  }
+  return null;
+}
+
+/**
+ * Back-compat: path like onnx-community/…/onnx/file.onnx
+ * @param {string} fullRel
+ */
+async function readFromModelLibraryPath(fullRel) {
+  if (!modelLibraryRoot || !fullRel) return null;
+  const parts = fullRel.split("/").filter(Boolean);
+  // voices or onnx near the end → split modelId / file
+  const onnxIdx = parts.indexOf("onnx");
+  const voicesIdx = parts.indexOf("voices");
+  const cut = onnxIdx >= 0 ? onnxIdx : voicesIdx >= 0 ? voicesIdx : -1;
+  if (cut > 0) {
+    const modelId = parts.slice(0, cut).join("/");
+    const fileRel = parts.slice(cut).join("/");
+    return readFromModelLibrary(modelId, fileRel);
+  }
+  // config.json etc.
+  if (parts.length >= 2 && parts[parts.length - 1].includes(".")) {
+    const fileRel = parts[parts.length - 1];
+    const modelId = parts.slice(0, -1).join("/");
+    const buf = await readFromModelLibrary(modelId, fileRel);
+    if (buf) return buf;
+  }
+  return readLibraryAbsolute(fullRel);
 }
 
 function libraryResponse(buf, contentType = "application/octet-stream") {
@@ -203,8 +305,8 @@ async function writeToVoiceCache(fileName, buf) {
 }
 
 /**
- * Load a voice once: memory → Cache API → local disk → Hugging Face.
- * Later generates for the same voice are free (no network).
+ * Load a voice once: memory → Cache API → user library → self-hosted /models.
+ * Never hits Hugging Face at runtime.
  */
 async function fetchVoiceBuffer(fileName) {
   if (voiceMemory.has(fileName)) return voiceMemory.get(fileName);
@@ -217,9 +319,9 @@ async function fetchVoiceBuffer(fileName) {
       return cached;
     }
 
-    // User model library (custom folder)
+    // User model library (custom folder, layout-aware)
     for (const repo of [MODEL_ID, V1_MODEL_ID]) {
-      const libBuf = await readFromModelLibrary(`${repo}/voices/${fileName}`);
+      const libBuf = await readFromModelLibrary(repo, `voices/${fileName}`);
       if (libBuf && libBuf.byteLength >= MIN_VOICE_BYTES) {
         voiceMemory.set(fileName, libBuf);
         await writeToVoiceCache(fileName, libBuf);
@@ -227,7 +329,7 @@ async function fetchVoiceBuffer(fileName) {
       }
     }
 
-    // Dev / optional public/models on the host
+    // Self-hosted public/models on this origin (Pages / local dev)
     const localCandidates = [
       `${MODEL_BASE}voices/${fileName}`,
       `${V1_VOICES_BASE}voices/${fileName}`,
@@ -247,23 +349,8 @@ async function fetchVoiceBuffer(fileName) {
       }
     }
 
-    console.warn(`Local voice ${fileName} missing; trying Hugging Face…`);
-    const remoteIds = [...new Set([MODEL_ID, V1_MODEL_ID])];
-    for (const repo of remoteIds) {
-      try {
-        const remote = await originalFetch(HF_VOICE_URL(fileName, repo));
-        if (!remote.ok || remote.status === 204) continue;
-        const buf = await remote.arrayBuffer();
-        if (buf.byteLength < MIN_VOICE_BYTES) continue;
-        voiceMemory.set(fileName, buf);
-        await writeToVoiceCache(fileName, buf);
-        return buf;
-      } catch {
-        /* try next repo */
-      }
-    }
     throw new Error(
-      `Voice "${fileName.replace(/\.bin$/, "")}" not found locally or on Hugging Face.`,
+      `Voice "${fileName.replace(/\.bin$/, "")}" not found in your model library or site models. Pick a library folder (Storage) and Download the model.`,
     );
   })();
 
@@ -290,38 +377,67 @@ self.fetch = (input, init) => {
     return originalFetch(input, init);
   }
 
-  // Voice bins (kokoro hardcodes HF URLs)
+  // Voice bins (kokoro hardcodes HF URLs) → local only
   const voiceMatch = url.match(HF_VOICE_RE);
   if (voiceMatch) {
     return fetchVoiceBuffer(voiceMatch[2]).then((buf) => voiceResponse(buf));
   }
 
-  // User library: serve model files without hitting the network
-  if (modelLibraryRoot) {
-    let libRel = null;
-    const hfFile = url.match(HF_ANY_FILE_RE);
-    if (hfFile) {
-      libRel = `${hfFile[1]}/${hfFile[2]}`;
-    } else {
-      // /models/{modelId}/...
-      try {
-        const u = new URL(url, self.location.origin);
-        const m = u.pathname.match(/\/models\/(.+)$/);
-        if (m) libRel = decodeURIComponent(m[1]);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (libRel) {
-      return readFromModelLibrary(libRel).then((buf) => {
-        if (buf) {
-          const ct = libRel.endsWith(".json")
-            ? "application/json"
-            : "application/octet-stream";
-          return libraryResponse(buf, ct);
+  // Any other HF model file → serve from library or self-hosted /models, never HF
+  const hfFile = url.match(HF_ANY_FILE_RE);
+  if (hfFile) {
+    const modelId = hfFile[1];
+    const fileRel = hfFile[2];
+    return (async () => {
+      let buf = await readFromModelLibrary(modelId, fileRel);
+      if (!buf) {
+        // Self-hosted under /models/{modelId}/...
+        const localUrl = new URL(
+          `models/${modelId}/${fileRel}`,
+          self.location.origin + BASE_URL,
+        ).href;
+        try {
+          const res = await originalFetch(localUrl);
+          if (res.ok && res.status !== 204) {
+            const body = await res.arrayBuffer();
+            if (body.byteLength > 0) buf = body;
+          }
+        } catch {
+          /* ignore */
         }
-        return originalFetch(input, init);
-      });
+      }
+      if (buf) {
+        const ct = fileRel.endsWith(".json")
+          ? "application/json"
+          : "application/octet-stream";
+        return libraryResponse(buf, ct);
+      }
+      return new Response(
+        `Offline mode: missing local file ${modelId}/${fileRel}. Choose a model library folder and Download.`,
+        { status: 404, statusText: "Not Found (local only)" },
+      );
+    })();
+  }
+
+  // Same-origin /models/... also prefer user library when set
+  if (modelLibraryRoot) {
+    try {
+      const u = new URL(url, self.location.origin);
+      const m = u.pathname.match(/\/models\/(.+)$/);
+      if (m) {
+        const fullRel = decodeURIComponent(m[1]);
+        return readFromModelLibraryPath(fullRel).then((buf) => {
+          if (buf) {
+            const ct = fullRel.endsWith(".json")
+              ? "application/json"
+              : "application/octet-stream";
+            return libraryResponse(buf, ct);
+          }
+          return originalFetch(input, init);
+        });
+      }
+    } catch {
+      /* ignore */
     }
   }
 
@@ -361,18 +477,28 @@ async function filterVoicesToLocal(voices) {
   if (!voices || typeof voices !== "object") return voices;
 
   let selfHosted = false;
-  try {
-    const res = await originalFetch(`${MODEL_BASE}voices/af_heart.bin`, {
-      method: "HEAD",
-    });
-    const type = (res.headers.get("content-type") || "").toLowerCase();
-    selfHosted =
-      res.ok &&
-      res.status === 200 &&
-      !type.includes("text/html") &&
-      !type.includes("text/plain");
-  } catch {
-    selfHosted = false;
+  if (modelLibraryRoot) {
+    const buf = await readFromModelLibrary(MODEL_ID, "voices/af_heart.bin");
+    if (buf && buf.byteLength >= MIN_VOICE_BYTES) selfHosted = true;
+    if (!selfHosted) {
+      const buf2 = await readFromModelLibrary(V1_MODEL_ID, "voices/af_heart.bin");
+      if (buf2 && buf2.byteLength >= MIN_VOICE_BYTES) selfHosted = true;
+    }
+  }
+  if (!selfHosted) {
+    try {
+      const res = await originalFetch(`${MODEL_BASE}voices/af_heart.bin`, {
+        method: "HEAD",
+      });
+      const type = (res.headers.get("content-type") || "").toLowerCase();
+      selfHosted =
+        res.ok &&
+        res.status === 200 &&
+        !type.includes("text/html") &&
+        !type.includes("text/plain");
+    } catch {
+      selfHosted = false;
+    }
   }
 
   if (!selfHosted) return voices;
@@ -403,6 +529,21 @@ async function detectWebGPU() {
  * would otherwise make HEAD checks lie and cause protobuf parse errors.
  */
 async function existsOnnx(url) {
+  // Prefer user library (layout-aware) when URL maps to /models/{id}/onnx/file
+  if (modelLibraryRoot) {
+    try {
+      const u = new URL(url, self.location.origin);
+      const m = u.pathname.match(/\/models\/(.+)$/);
+      if (m) {
+        const fullRel = decodeURIComponent(m[1]);
+        const buf = await readFromModelLibraryPath(fullRel);
+        if (buf && buf.byteLength >= 1_000_000) return true;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
   try {
     const res = await originalFetch(url, { method: "HEAD" });
     if (!res.ok) return false;
@@ -499,7 +640,7 @@ async function pickRuntime(preferWebGPU) {
   if (MODEL_ID !== V1_MODEL_ID) {
     const hasV1Q8 = await existsOnnx(v1Q8Url);
     if (hasV1Q8) {
-      // Use self-hosted v1 weights instead of hanging on a remote download
+      // Use self-hosted v1 weights instead of remote
       MODEL_ID = V1_MODEL_ID;
       MODEL_BASE = V1_VOICES_BASE;
       return { device: "wasm", dtype: "q8", source: "local-v1-q8" };
@@ -511,12 +652,35 @@ async function pickRuntime(preferWebGPU) {
     }
   }
 
-  // Remote Hugging Face — use the catalog dtype (may download)
-  return {
-    device: pickDevice(wanted),
-    dtype: wanted,
-    source: "huggingface",
-  };
+  // Also probe user library directly for wanted / q8
+  if (modelLibraryRoot) {
+    for (const [dtype, file] of [
+      [wanted, onnxFileForDtype(wanted)],
+      ["q8", "model_quantized.onnx"],
+    ]) {
+      for (const id of [MODEL_ID, V1_MODEL_ID]) {
+        const buf = await readFromModelLibrary(id, `onnx/${file}`);
+        if (buf && buf.byteLength >= 1_000_000) {
+          if (id !== MODEL_ID) {
+            MODEL_ID = id;
+            MODEL_BASE = new URL(
+              `models/${id}/`,
+              self.location.origin + BASE_URL,
+            ).pathname.replace(/\/?$/, "/");
+          }
+          return {
+            device: pickDevice(dtype),
+            dtype,
+            source: `library-${dtype}`,
+          };
+        }
+      }
+    }
+  }
+
+  throw new Error(
+    "No local model weights found. Open Storage → choose a model library folder (or host models under /models/), then Download the pack you need. Online Hugging Face loading is disabled.",
+  );
 }
 
 /** Split long text so each chunk stays within Kokoro's comfortable length. */
@@ -723,15 +887,10 @@ async function init(modelKey) {
     let pick = await pickRuntime(hasWebGPU);
     let { device, dtype } = pick;
 
-    // If user asked for a dtype we couldn't find locally and we're on HF,
-    // still use their preferred dtype so remote weights match the catalog.
-    if (pick.source === "huggingface") {
-      dtype = activeModel.dtype || dtype;
-    }
-
-    const sourceLabel =
-      pick.source === "huggingface"
-        ? "Hugging Face (may download weights)"
+    const sourceLabel = pick.source.startsWith("library")
+      ? `model library (${pick.source})`
+      : pick.source.startsWith("local")
+        ? `site models (${pick.source})`
         : pick.source;
 
     self.postMessage({
@@ -803,7 +962,7 @@ async function init(modelKey) {
       type: "error",
       message:
         (error?.message || String(error)) +
-        " — Choose a model library folder and Download, or allow Hugging Face access.",
+        " — Offline only: set a model library folder under Storage and Download weights, or ship models under /models/.",
       modelKey: activeModelKey,
     });
   } finally {
@@ -827,6 +986,8 @@ self.addEventListener("message", async (event) => {
 
   if (data.type === "set-model-library") {
     modelLibraryRoot = data.handle || null;
+    modelLibraryLayout = data.layout || "auto";
+    modelLibraryLayoutResolved = null;
     return;
   }
 

@@ -12,6 +12,7 @@ import {
 import {
   downloadEntryFiles,
   isEntryInLibrary,
+  scanLibraryCatalog,
 } from "./modelLibrary.js";
 import {
   isGithubSaveReady,
@@ -25,6 +26,7 @@ const STORAGE_KEYS = {
   filenamePrefix: "knullclear.filenamePrefix",
   autoSave: "knullclear.autoSave",
   modelKey: "knullclear.modelKey",
+  modelLibLayout: "knullclear.modelLibLayout",
 };
 
 const IDB_NAME = "knull-and-clear";
@@ -69,8 +71,11 @@ const els = {
   folderHint: document.getElementById("folder-hint"),
   modelLibLabel: document.getElementById("model-lib-label"),
   pickModelLibBtn: document.getElementById("pick-model-lib-btn"),
+  rescanModelLibBtn: document.getElementById("rescan-model-lib-btn"),
   clearModelLibBtn: document.getElementById("clear-model-lib-btn"),
   modelLibHint: document.getElementById("model-lib-hint"),
+  modelLibLayout: document.getElementById("model-lib-layout"),
+  modelLibScan: document.getElementById("model-lib-scan"),
   githubSaveEnabled: document.getElementById("github-save-enabled"),
   githubModelsFields: document.getElementById("github-models-fields"),
   githubOwner: document.getElementById("github-owner"),
@@ -251,14 +256,17 @@ function closeModelMenu() {
  */
 async function isModelDownloaded(entry) {
   const full = getModelEntry(entry.key || entry);
+  const layout = getModelLibLayout();
 
-  // Preferred: user-chosen library folder (GitHub Pages / any host)
+  // Preferred: user-chosen library folder
   if (modelLibDirHandle) {
     const ok = await ensureDirPermission(modelLibDirHandle);
-    if (ok && (await isEntryInLibrary(modelLibDirHandle, full))) return true;
+    if (ok && (await isEntryInLibrary(modelLibDirHandle, full, layout))) {
+      return true;
+    }
   }
 
-  // Local dev: files served from public/models
+  // Self-hosted site models under public/models (offline origin only)
   const path = localOnnxPublicPath(full, import.meta.env.BASE_URL || "/");
   try {
     const res = await fetch(path, { method: "HEAD" });
@@ -271,6 +279,25 @@ async function isModelDownloaded(entry) {
   } catch {
     return false;
   }
+}
+
+function getModelLibLayout() {
+  const v = els.modelLibLayout?.value || "auto";
+  if (["auto", "nested", "flat", "public-models"].includes(v)) return v;
+  return "auto";
+}
+
+function setModelLibLayout(value) {
+  const v = ["auto", "nested", "flat", "public-models"].includes(value)
+    ? value
+    : "auto";
+  if (els.modelLibLayout) els.modelLibLayout.value = v;
+  try {
+    localStorage.setItem(STORAGE_KEYS.modelLibLayout, v);
+  } catch {
+    /* ignore */
+  }
+  return v;
 }
 
 /** @type {Map<string, boolean>} */
@@ -480,6 +507,7 @@ async function downloadModelToDisk(key) {
         const files = await downloadEntryFiles({
           modelKey: entry.key,
           libraryRoot: modelLibDirHandle || null,
+          layout: getModelLibLayout(),
           returnBuffers: true,
           onProgress: applyProgress,
         });
@@ -502,18 +530,22 @@ async function downloadModelToDisk(key) {
       await downloadEntryFiles({
         modelKey: entry.key,
         libraryRoot: modelLibDirHandle,
+        layout: getModelLibLayout(),
         returnBuffers: false,
         onProgress: applyProgress,
       });
       sendModelLibraryToWorker();
+      await refreshModelLibScan();
     } else if (!wantGithub && modelLibDirHandle) {
       await downloadEntryFiles({
         modelKey: entry.key,
         libraryRoot: modelLibDirHandle,
+        layout: getModelLibLayout(),
         returnBuffers: false,
         onProgress: applyProgress,
       });
       sendModelLibraryToWorker();
+      await refreshModelLibScan();
     }
 
     modelDownloadStatus.set(entry.key, true);
@@ -668,29 +700,74 @@ function updateModelLibUi() {
   if (!supportsDirPicker) {
     els.modelLibLabel.textContent = "Not supported in this browser";
     if (els.pickModelLibBtn) els.pickModelLibBtn.hidden = true;
+    if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = true;
     if (els.clearModelLibBtn) els.clearModelLibBtn.hidden = true;
+    if (els.modelLibLayout) els.modelLibLayout.disabled = true;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Use Chrome or Edge to store models in a folder on your PC. Otherwise models load from Hugging Face.";
+        "Use Chrome or Edge to pick a local model folder. Runtime is offline-only.";
     }
+    if (els.modelLibScan) els.modelLibScan.hidden = true;
     return;
   }
   if (modelLibDirHandle) {
     els.modelLibLabel.textContent = modelLibDirHandle.name;
     els.modelLibLabel.title = modelLibDirHandle.name;
     if (els.clearModelLibBtn) els.clearModelLibBtn.hidden = false;
+    if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = false;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Downloads and offline loads use this folder. Layout: {folder}/{model-id}/onnx/…";
+        "Offline loads + Download write here. Layout auto-detects nested, flat pack, or public/models.";
     }
   } else {
-    els.modelLibLabel.textContent = "Not set (use web / Hugging Face)";
+    els.modelLibLabel.textContent = "Not set — pick a folder with model packs";
     els.modelLibLabel.title = "";
     if (els.clearModelLibBtn) els.clearModelLibBtn.hidden = true;
+    if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = true;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Chrome / Edge: pick a folder on your PC for TTS weights. The GitHub site stays app-only.";
+        "Chrome / Edge: choose where TTS weights live. Site /models/ still works if you host packs there. No online HF loading.";
     }
+    if (els.modelLibScan) {
+      els.modelLibScan.hidden = true;
+      els.modelLibScan.textContent = "";
+    }
+  }
+}
+
+async function refreshModelLibScan() {
+  if (!els.modelLibScan || !modelLibDirHandle) {
+    if (els.modelLibScan) {
+      els.modelLibScan.hidden = true;
+      els.modelLibScan.textContent = "";
+    }
+    return;
+  }
+  if (!(await ensureDirPermission(modelLibDirHandle))) {
+    els.modelLibScan.hidden = false;
+    els.modelLibScan.textContent = "Need folder permission to scan.";
+    return;
+  }
+  try {
+    const layout = getModelLibLayout();
+    const scan = await scanLibraryCatalog(modelLibDirHandle, layout);
+    const present = scan.models.filter((m) => m.present).map((m) => m.shortLabel);
+    const missing = scan.models.filter((m) => !m.present).map((m) => m.shortLabel);
+    const lines = [
+      `Layout: ${scan.layout}${layout === "auto" ? " (auto)" : ""}`,
+      present.length
+        ? `Found: ${present.join(", ")}`
+        : "Found: (no catalog packs yet — use Download)",
+      scan.detected.modelIds?.length
+        ? `Packs: ${scan.detected.modelIds.slice(0, 6).join(", ")}${scan.detected.modelIds.length > 6 ? "…" : ""}`
+        : null,
+      missing.length ? `Missing: ${missing.join(", ")}` : null,
+    ].filter(Boolean);
+    els.modelLibScan.hidden = false;
+    els.modelLibScan.textContent = lines.join("\n");
+  } catch (e) {
+    els.modelLibScan.hidden = false;
+    els.modelLibScan.textContent = e?.message || "Scan failed.";
   }
 }
 
@@ -713,8 +790,16 @@ async function pickModelLibraryFolder() {
     await idbSet(IDB_MODEL_LIB_KEY, handle);
     updateModelLibUi();
     sendModelLibraryToWorker();
+    await refreshModelLibScan();
     await refreshModelDownloadStatus();
-    setStatus(`Model library set to “${handle.name}”.`, "success");
+    // Reload current model so worker re-reads from the new library
+    if (ready || worker) {
+      startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
+    }
+    setStatus(
+      `Model library set to “${handle.name}” (${getModelLibLayout()} layout). Offline only.`,
+      "success",
+    );
     return true;
   } catch (e) {
     if (e?.name === "AbortError") return false;
@@ -733,7 +818,11 @@ async function clearModelLibraryFolder() {
   updateModelLibUi();
   sendModelLibraryToWorker();
   await refreshModelDownloadStatus();
-  setStatus("Model library cleared — models load from the web when needed.", "success");
+  setStatus(
+    "Model library cleared — only self-hosted /models/ on this site are used (no online HF).",
+    "success",
+  );
+  if (worker) startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
 }
 
 function sendModelLibraryToWorker() {
@@ -742,6 +831,7 @@ function sendModelLibraryToWorker() {
     worker.postMessage({
       type: "set-model-library",
       handle: modelLibDirHandle || null,
+      layout: getModelLibLayout(),
     });
   } catch (e) {
     console.warn("Could not send model library to worker:", e);
@@ -1111,6 +1201,7 @@ async function restoreSaveDirectory() {
   }
   updateFolderUi();
   updateModelLibUi();
+  await refreshModelLibScan().catch(() => {});
   await refreshModelDownloadStatus().catch(() => {});
 }
 
@@ -1399,6 +1490,8 @@ function handleWorkerMessage(event) {
 
   switch (data.type) {
     case "worker-ready": {
+      // Attach library before first model load (offline path)
+      sendModelLibraryToWorker();
       sendModelLibraryToWorker();
       worker?.postMessage({
         type: "load-model",
@@ -1452,11 +1545,13 @@ function handleWorkerMessage(event) {
       populateVoices(data.voices);
       if (data.device) {
         const dtype = data.dtype ? ` · ${data.dtype}` : "";
-        const src =
-          data.source && String(data.source).startsWith("local")
-            ? " · self-hosted"
-            : data.source === "huggingface"
-              ? " · Hugging Face"
+        const srcRaw = String(data.source || "");
+        const src = srcRaw.startsWith("library")
+          ? " · model library"
+          : srcRaw.startsWith("local")
+            ? " · site models"
+            : srcRaw
+              ? ` · ${srcRaw}`
               : "";
         const modelBit = data.modelShortLabel
           ? ` · ${data.modelShortLabel}`
@@ -1469,11 +1564,11 @@ function handleWorkerMessage(event) {
       els.modelTrigger.disabled = false;
       setGenerating(false);
       setStatus(
-        `Ready — ${data.modelShortLabel || "model"} loaded. Enter text and generate.`,
+        `Ready — ${data.modelShortLabel || "model"} loaded (offline). Enter text and generate.`,
         "success",
       );
-      // Re-check disk icons (e.g. after first remote download)
       refreshModelDownloadStatus().catch(() => {});
+      refreshModelLibScan().catch(() => {});
       setTimeout(hideOverlay, 350);
       break;
     }
@@ -1524,6 +1619,9 @@ function loadLocalSettings() {
     else els.filenamePrefix.value = "knull-clear";
 
     els.autoSave.checked = localStorage.getItem(STORAGE_KEYS.autoSave) === "1";
+    const layout = localStorage.getItem(STORAGE_KEYS.modelLibLayout);
+    if (layout) setModelLibLayout(layout);
+    else if (els.modelLibLayout) els.modelLibLayout.value = "auto";
   } catch {
     els.filenamePrefix.value = "knull-clear";
   }
@@ -1642,8 +1740,24 @@ function bindEvents() {
       setStatus(e?.message || "Model library picker failed.", "error"),
     );
   });
+  els.rescanModelLibBtn?.addEventListener("click", () => {
+    refreshModelLibScan()
+      .then(() => refreshModelDownloadStatus())
+      .then(() => setStatus("Model library rescanned.", "success"))
+      .catch((e) => setStatus(e?.message || "Rescan failed.", "error"));
+  });
   els.clearModelLibBtn?.addEventListener("click", () => {
     clearModelLibraryFolder().catch(() => {});
+  });
+  els.modelLibLayout?.addEventListener("change", async () => {
+    setModelLibLayout(els.modelLibLayout.value);
+    sendModelLibraryToWorker();
+    await refreshModelLibScan();
+    await refreshModelDownloadStatus();
+    setStatus(`Library layout: ${getModelLibLayout()}.`, "success");
+    if (modelLibDirHandle && worker) {
+      startWorker(selectedModelKey || DEFAULT_MODEL_KEY);
+    }
   });
 
   els.githubSaveEnabled?.addEventListener("change", () => {

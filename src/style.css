@@ -803,6 +803,26 @@ a:hover {
   gap: 0.5rem;
 }
 
+.model-lib-control {
+  gap: 0.55rem;
+}
+
+.model-lib-layout-grid {
+  margin-top: 0.55rem;
+}
+
+.model-lib-layout-grid select {
+  width: 100%;
+  cursor: pointer;
+}
+
+.model-lib-scan {
+  color: var(--accent-2) !important;
+  font-family: var(--mono);
+  font-size: 0.72rem !important;
+  white-space: pre-wrap;
+}
+
 .github-models-control {
   gap: 0.65rem;
 }
