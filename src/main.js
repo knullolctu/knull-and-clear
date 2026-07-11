@@ -1492,7 +1492,6 @@ function handleWorkerMessage(event) {
     case "worker-ready": {
       // Attach library before first model load (offline path)
       sendModelLibraryToWorker();
-      sendModelLibraryToWorker();
       worker?.postMessage({
         type: "load-model",
         modelKey: pendingWorkerModelKey || selectedModelKey || DEFAULT_MODEL_KEY,
