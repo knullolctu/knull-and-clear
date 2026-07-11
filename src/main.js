@@ -69,6 +69,10 @@ const els = {
   modelLibHint: document.getElementById("model-lib-hint"),
   modelLibLayout: document.getElementById("model-lib-layout"),
   modelLibScan: document.getElementById("model-lib-scan"),
+  setupModal: document.getElementById("setup-modal"),
+  setupChooseFolderBtn: document.getElementById("setup-choose-folder-btn"),
+  setupOpenStorageBtn: document.getElementById("setup-open-storage-btn"),
+  setupModalError: document.getElementById("setup-modal-error"),
   filenamePrefix: document.getElementById("filename-prefix"),
   autoSave: document.getElementById("auto-save"),
 };
@@ -177,6 +181,42 @@ function enterSetupMode(message) {
     message ||
       "Set Storage → Model library folder first, then Download a model and select it to load.",
   );
+}
+
+function showSetupModal(errorText = "") {
+  if (!els.setupModal) return;
+  els.setupModal.hidden = false;
+  els.setupModal.classList.remove("is-hidden");
+  if (els.setupModalError) {
+    if (errorText) {
+      els.setupModalError.hidden = false;
+      els.setupModalError.textContent = errorText;
+    } else {
+      els.setupModalError.hidden = true;
+      els.setupModalError.textContent = "";
+    }
+  }
+  // Focus primary action for keyboard users
+  queueMicrotask(() => els.setupChooseFolderBtn?.focus());
+}
+
+function hideSetupModal() {
+  if (!els.setupModal) return;
+  els.setupModal.classList.add("is-hidden");
+  els.setupModal.hidden = true;
+  if (els.setupModalError) {
+    els.setupModalError.hidden = true;
+    els.setupModalError.textContent = "";
+  }
+}
+
+function openStorageSection() {
+  const details = document.getElementById("save-settings");
+  if (details) {
+    details.open = true;
+    details.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+  els.pickModelLibBtn?.focus();
 }
 
 function escapeHtml(value) {
@@ -617,9 +657,12 @@ async function refreshModelLibScan() {
   }
 }
 
-async function pickModelLibraryFolder() {
+async function pickModelLibraryFolder({ fromSetupModal = false } = {}) {
   if (!supportsDirPicker) {
-    setStatus("Folder picker needs Chrome or Edge.", "error");
+    const msg =
+      "Folder picker needs Chrome or Edge. Use one of those browsers to choose where models are saved.";
+    if (fromSetupModal) showSetupModal(msg);
+    setStatus(msg, "error");
     return false;
   }
   try {
@@ -629,7 +672,9 @@ async function pickModelLibraryFolder() {
       startIn: "documents",
     });
     if (!(await ensureDirPermission(handle))) {
-      setStatus("Permission denied for model library folder.", "error");
+      const msg = "Permission denied for that folder. Pick another location.";
+      if (fromSetupModal) showSetupModal(msg);
+      setStatus(msg, "error");
       return false;
     }
     modelLibDirHandle = handle;
@@ -647,13 +692,23 @@ async function pickModelLibraryFolder() {
       }
       worker = null;
     }
+    hideSetupModal();
     enterSetupMode(
-      `Library “${handle.name}” ready (${getModelLibLayout()}). Download a model if needed, then pick it in the list to load.`,
+      `Models will be saved in “${handle.name}”. Download a model, then select it to load.`,
     );
     return true;
   } catch (e) {
-    if (e?.name === "AbortError") return false;
-    setStatus(e?.message || "Could not open folder picker.", "error");
+    if (e?.name === "AbortError") {
+      if (fromSetupModal) {
+        showSetupModal(
+          "No folder selected yet. Choose a folder to continue — models are stored only on your PC.",
+        );
+      }
+      return false;
+    }
+    const msg = e?.message || "Could not open folder picker.";
+    if (fromSetupModal) showSetupModal(msg);
+    setStatus(msg, "error");
     return false;
   }
 }
@@ -676,8 +731,9 @@ async function clearModelLibraryFolder() {
   }
   await refreshModelDownloadStatus();
   enterSetupMode(
-    "Model library cleared. Choose a folder under Storage before loading any model.",
+    "Model library cleared. Choose where models should be saved on your PC.",
   );
+  showSetupModal();
 }
 
 function sendModelLibraryToWorker() {
@@ -1609,6 +1665,18 @@ function bindEvents() {
       setStatus(e?.message || "Model library picker failed.", "error"),
     );
   });
+  els.setupChooseFolderBtn?.addEventListener("click", () => {
+    pickModelLibraryFolder({ fromSetupModal: true }).catch((e) => {
+      showSetupModal(e?.message || "Folder picker failed.");
+    });
+  });
+  els.setupOpenStorageBtn?.addEventListener("click", () => {
+    hideSetupModal();
+    openStorageSection();
+    setStatus(
+      "Open Storage → Choose folder… to set where models are saved on your PC.",
+    );
+  });
   els.rescanModelLibBtn?.addEventListener("click", () => {
     refreshModelLibScan()
       .then(() => refreshModelDownloadStatus())
@@ -1695,22 +1763,44 @@ async function main() {
   bindEvents();
   await restoreSaveDirectory();
 
-  // No startup model load / no "Tuning" overlay — library first
+  // No startup model load — library folder first
   hideOverlay();
   if (els.modelTrigger) els.modelTrigger.disabled = false;
   if (els.generateBtn) els.generateBtn.disabled = true;
   if (els.voiceTrigger) els.voiceTrigger.disabled = true;
   if (els.deviceBadge) els.deviceBadge.textContent = "device: — · setup";
 
+  // If we have a saved handle, confirm permission still works
+  if (modelLibDirHandle) {
+    const ok = await ensureDirPermission(modelLibDirHandle);
+    if (!ok) {
+      modelLibDirHandle = null;
+      try {
+        await idbDelete(IDB_MODEL_LIB_KEY);
+      } catch {
+        /* ignore */
+      }
+      updateModelLibUi();
+    }
+  }
+
   if (!modelLibDirHandle) {
     enterSetupMode(
-      "Welcome. Open Storage → choose a model library folder on your PC, Download a model, then select it to load.",
+      "First visit: choose where TTS models should be saved on your PC.",
     );
-    const details = document.getElementById("save-settings");
-    if (details) details.open = true;
+    openStorageSection();
+    // Folder picker requires a click — show a clear first-run dialog
+    if (supportsDirPicker) {
+      showSetupModal();
+    } else {
+      showSetupModal(
+        "This browser cannot pick folders. Open the app in Chrome or Edge to choose a model save location.",
+      );
+    }
   } else {
+    hideSetupModal();
     enterSetupMode(
-      `Library “${modelLibDirHandle.name}” is set. Download if needed, then select a model to load from disk.`,
+      `Models save to “${modelLibDirHandle.name}”. Download if needed, then select a model to load.`,
     );
   }
 }

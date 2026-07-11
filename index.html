@@ -17,6 +17,57 @@
       <div class="bg-grid"></div>
     </div>
 
+    <!-- First visit: where should models be stored locally? -->
+    <div
+      id="setup-modal"
+      class="setup-modal is-hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="setup-modal-title"
+      hidden
+    >
+      <div class="setup-modal-card">
+        <div class="setup-modal-logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="32" height="32" rx="9" fill="url(#setupGrad)" />
+            <path
+              d="M8 16c2-4 4-6 8-6s6 2 8 6c-2 4-4 6-8 6s-6-2-8-6z"
+              stroke="white"
+              stroke-width="1.6"
+              fill="none"
+            />
+            <circle cx="16" cy="16" r="2.2" fill="white" />
+            <defs>
+              <linearGradient id="setupGrad" x1="0" y1="0" x2="32" y2="32">
+                <stop stop-color="#8b5cf6" />
+                <stop offset="1" stop-color="#2dd4bf" />
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <h2 id="setup-modal-title" class="setup-modal-title">Where should models be saved?</h2>
+        <p class="setup-modal-body">
+          Knull &amp; Clear stores TTS weights <strong>only on your PC</strong> — nothing is
+          downloaded until you pick a folder. Choose a location for your model library
+          (for example a folder named <code>knull-models</code>).
+        </p>
+        <ul class="setup-modal-list">
+          <li>Models stay offline in the folder you choose</li>
+          <li>You can change it later under Storage</li>
+          <li>Chrome or Edge recommended (folder access API)</li>
+        </ul>
+        <button id="setup-choose-folder-btn" class="btn btn-primary setup-modal-btn" type="button">
+          Choose model folder…
+        </button>
+        <p id="setup-modal-error" class="setup-modal-error" hidden></p>
+        <p class="setup-modal-foot">
+          Need a moment? You can also open
+          <button type="button" id="setup-open-storage-btn" class="linkish">Storage</button>
+          in the app.
+        </p>
+      </div>
+    </div>
+
     <!-- Loading overlay: only shown when user explicitly loads a local model -->
     <div
       id="loading-overlay"
