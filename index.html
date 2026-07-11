@@ -238,68 +238,6 @@
                 </p>
                 <p class="hint model-lib-scan" id="model-lib-scan" hidden></p>
               </div>
-              <div class="control github-models-control">
-                <label class="check-card" for="github-save-enabled">
-                  <input id="github-save-enabled" type="checkbox" checked />
-                  <span>
-                    <strong>Save downloads to GitHub repo</strong>
-                    <small>Download runs a GitHub Action that commits the model under public/models/</small>
-                  </span>
-                </label>
-                <div class="github-models-fields" id="github-models-fields" hidden>
-                  <div class="settings-grid github-repo-grid">
-                    <div class="control">
-                      <label class="field-label" for="github-owner">Owner</label>
-                      <input
-                        id="github-owner"
-                        class="text-input text-input-sm"
-                        type="text"
-                        spellcheck="false"
-                        autocomplete="off"
-                        placeholder="knullolctu"
-                      />
-                    </div>
-                    <div class="control">
-                      <label class="field-label" for="github-repo">Repo</label>
-                      <input
-                        id="github-repo"
-                        class="text-input text-input-sm"
-                        type="text"
-                        spellcheck="false"
-                        autocomplete="off"
-                        placeholder="knull-and-clear"
-                      />
-                    </div>
-                    <div class="control">
-                      <label class="field-label" for="github-branch">Branch</label>
-                      <input
-                        id="github-branch"
-                        class="text-input text-input-sm"
-                        type="text"
-                        spellcheck="false"
-                        autocomplete="off"
-                        placeholder="master"
-                      />
-                    </div>
-                    <div class="control">
-                      <label class="field-label" for="github-token">Token</label>
-                      <input
-                        id="github-token"
-                        class="text-input text-input-sm"
-                        type="password"
-                        spellcheck="false"
-                        autocomplete="off"
-                        placeholder="ghp_… (repo write)"
-                      />
-                    </div>
-                  </div>
-                  <p class="hint" id="github-models-hint">
-                    Paste a classic token with <code>repo</code> + <code>workflow</code> scopes
-                    (or fine-grained: Actions write + Contents write). Stored only in this browser.
-                    Then every Download saves that model into the repo.
-                  </p>
-                </div>
-              </div>
               <div class="control">
                 <span class="field-label">Audio save folder</span>
                 <div class="folder-row">

@@ -823,31 +823,6 @@ a:hover {
   white-space: pre-wrap;
 }
 
-.github-models-control {
-  gap: 0.65rem;
-}
-
-.github-models-fields {
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
-  margin-top: 0.65rem;
-  padding: 0.85rem;
-  border-radius: var(--radius-xs);
-  border: 1px solid var(--border);
-  background: var(--bg-soft);
-}
-
-.github-repo-grid {
-  grid-template-columns: 1fr 1fr;
-}
-
-.github-models-fields code {
-  font-family: var(--mono);
-  font-size: 0.85em;
-  color: var(--accent-2);
-}
-
 .folder-label {
   flex: 1 1 140px;
   min-width: 0;

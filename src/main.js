@@ -14,13 +14,6 @@ import {
   isEntryInLibrary,
   scanLibraryCatalog,
 } from "./modelLibrary.js";
-import {
-  isGithubSaveReady,
-  loadGithubModelsConfig,
-  saveGithubModelsConfig,
-  triggerAddModelWorkflow,
-  uploadModelFilesToRepo,
-} from "./githubRepoModels.js";
 
 const STORAGE_KEYS = {
   filenamePrefix: "knullclear.filenamePrefix",
@@ -76,13 +69,6 @@ const els = {
   modelLibHint: document.getElementById("model-lib-hint"),
   modelLibLayout: document.getElementById("model-lib-layout"),
   modelLibScan: document.getElementById("model-lib-scan"),
-  githubSaveEnabled: document.getElementById("github-save-enabled"),
-  githubModelsFields: document.getElementById("github-models-fields"),
-  githubOwner: document.getElementById("github-owner"),
-  githubRepo: document.getElementById("github-repo"),
-  githubBranch: document.getElementById("github-branch"),
-  githubToken: document.getElementById("github-token"),
-  githubModelsHint: document.getElementById("github-models-hint"),
   filenamePrefix: document.getElementById("filename-prefix"),
   autoSave: document.getElementById("auto-save"),
 };
@@ -336,28 +322,22 @@ function updateModelDownloadIcons() {
     if (badge) {
       badge.textContent = downloaded ? "✓" : "☁";
       badge.title = downloaded
-        ? "Downloaded — available offline"
-        : "Not downloaded — use Download to save under public/models";
+        ? "On disk in your model library"
+        : "Not on disk — Download into your model library folder";
       badge.classList.toggle("is-local", downloaded);
       badge.classList.toggle("is-remote", !downloaded);
       badge.setAttribute(
         "aria-label",
-        downloaded ? "Downloaded" : "Not downloaded",
+        downloaded ? "On disk" : "Not on disk",
       );
     }
     const dlBtn = btn.querySelector(".model-download-btn");
     if (dlBtn) {
-      // Show Download when missing, or always when GitHub save is ready (re-push)
-      const ghReady = isGithubSaveReady(loadGithubModelsConfig());
-      const showDl = !downloaded || ghReady;
-      dlBtn.hidden = !showDl;
-      dlBtn.disabled = isBusy || modelDownloadingKey != null;
-      if (showDl) {
-        dlBtn.textContent = isBusy
-          ? "Downloading…"
-          : downloaded && ghReady
-            ? "Push to GitHub"
-            : "Download";
+      dlBtn.hidden = Boolean(downloaded);
+      dlBtn.disabled =
+        Boolean(downloaded) || isBusy || modelDownloadingKey != null;
+      if (!downloaded) {
+        dlBtn.textContent = isBusy ? "Downloading…" : "Download";
       }
     }
   });
@@ -372,33 +352,26 @@ function updateModelDownloadIcons() {
   const selDownloaded = modelDownloadStatus.get(selectedModelKey) === true;
   triggerBadge.textContent = selDownloaded ? "✓" : "☁";
   triggerBadge.title = selDownloaded
-    ? "Downloaded — available offline"
-    : "Not downloaded — use Download to save under public/models";
+    ? "On disk in your model library"
+    : "Not on disk — Download into your model library folder";
   triggerBadge.classList.toggle("is-local", selDownloaded);
   triggerBadge.classList.toggle("is-remote", !selDownloaded);
 
-  // Inline download under picker — when missing, or when GitHub re-push is available
+  // Inline download under picker — only when selected model is not on disk
   if (els.modelDownloadRow && els.modelDownloadInline) {
     const busy = modelDownloadingKey != null;
     const entry = getModelEntry(selectedModelKey);
-    const ghReady = isGithubSaveReady(loadGithubModelsConfig());
-    const showDl = !selDownloaded || ghReady;
-    els.modelDownloadRow.hidden = !showDl;
-    els.modelDownloadInline.hidden = !showDl;
-    els.modelDownloadInline.disabled = busy;
-    if (showDl) {
-      const dest =
-        modelLibDirHandle && ghReady
-          ? "disk + GitHub"
-          : ghReady
-            ? "GitHub"
-            : "disk";
+    els.modelDownloadRow.hidden = Boolean(selDownloaded);
+    els.modelDownloadInline.hidden = Boolean(selDownloaded);
+    els.modelDownloadInline.disabled = busy || Boolean(selDownloaded);
+    if (!selDownloaded) {
+      const dest = modelLibDirHandle
+        ? `“${modelLibDirHandle.name}”`
+        : "your library folder";
       els.modelDownloadInline.textContent =
         modelDownloadingKey === selectedModelKey
           ? "Downloading…"
-          : selDownloaded && ghReady
-            ? `Push to GitHub (${entry.sizeHint})`
-            : `Download to ${dest} (${entry.sizeHint})`;
+          : `Download to ${dest} (${entry.sizeHint})`;
     }
     if (els.modelDownloadProgress) {
       const showProg =
@@ -409,7 +382,7 @@ function updateModelDownloadIcons() {
 
   const entry = getModelEntry(selectedModelKey);
   const statusWord = selDownloaded
-    ? "Downloaded ✓"
+    ? "On disk ✓"
     : "Not on disk — use Download";
   els.modelHint.textContent = `${entry.description} · ${entry.sizeHint} · ${statusWord}`;
 }
@@ -425,8 +398,7 @@ async function refreshModelDownloadStatus() {
 }
 
 /**
- * Download a catalog model into the user library folder and/or GitHub repo.
- * When GitHub save is ready, starts an Action that commits the model into the repo.
+ * Download a catalog model into the user-chosen local library folder only.
  * @param {string} key
  */
 async function downloadModelToDisk(key) {
@@ -436,40 +408,26 @@ async function downloadModelToDisk(key) {
     return;
   }
 
-  persistGithubModelsForm();
-  let ghConfig = loadGithubModelsConfig();
-  let wantGithub = isGithubSaveReady(ghConfig);
-
-  // GitHub save enabled but missing token — open Storage and stop
-  if (ghConfig.enabled && !wantGithub) {
-    openGithubSettingsForToken();
-    setStatus(
-      "Paste a GitHub token (repo + workflow) under Storage, then click Download again — the model will be saved to the repo.",
-      "error",
-    );
+  if (modelDownloadStatus.get(entry.key)) {
+    setStatus(`${entry.shortLabel} is already in your local library.`, "success");
     return;
   }
 
-  // Skip only when already available and we are not pushing to GitHub
-  if (modelDownloadStatus.get(entry.key) && !wantGithub) {
-    setStatus(`${entry.shortLabel} is already available.`, "success");
-    return;
-  }
-
-  // Local library optional if GitHub save will handle the repo
-  if (!modelLibDirHandle && !wantGithub) {
+  if (!modelLibDirHandle) {
     if (!supportsDirPicker) {
       setStatus(
-        "Enable Save downloads to GitHub (Storage) and paste a token, or use Chrome/Edge to pick a folder.",
+        "Use Chrome or Edge and choose a model library folder under Storage first.",
         "error",
       );
       return;
     }
+    const details = document.getElementById("save-settings");
+    if (details) details.open = true;
     const picked = await pickModelLibraryFolder();
     if (!picked) return;
   }
 
-  if (modelLibDirHandle && !(await ensureDirPermission(modelLibDirHandle))) {
+  if (!(await ensureDirPermission(modelLibDirHandle))) {
     setStatus("Permission needed to write models into your library folder.", "error");
     return;
   }
@@ -477,13 +435,9 @@ async function downloadModelToDisk(key) {
   modelDownloadingKey = entry.key;
   updateModelDownloadIcons();
   openModelMenu();
-  const destHint = [
-    modelLibDirHandle ? `folder “${modelLibDirHandle.name}”` : null,
-    wantGithub ? `GitHub ${ghConfig.owner}/${ghConfig.repo}` : null,
-  ]
-    .filter(Boolean)
-    .join(" + ");
-  setStatus(`Downloading ${entry.shortLabel} → ${destHint}…`);
+  setStatus(
+    `Downloading ${entry.shortLabel} → folder “${modelLibDirHandle.name}”…`,
+  );
 
   const applyProgress = (ev) => {
     const msg = ev.message || `Downloading ${entry.shortLabel}…`;
@@ -511,91 +465,24 @@ async function downloadModelToDisk(key) {
   };
 
   try {
-    let githubResult = null;
-
-    // Primary path: GitHub Action downloads + commits into the repo
-    if (wantGithub) {
-      try {
-        githubResult = await triggerAddModelWorkflow(
-          ghConfig,
-          entry.key,
-          applyProgress,
-        );
-      } catch (wfErr) {
-        console.warn("Workflow dispatch failed, trying direct upload:", wfErr);
-        // Fallback: browser fetch + Git Data API (files under ~100MB)
-        const files = await downloadEntryFiles({
-          modelKey: entry.key,
-          libraryRoot: modelLibDirHandle || null,
-          layout: getModelLibLayout(),
-          returnBuffers: true,
-          onProgress: applyProgress,
-        });
-        githubResult = await uploadModelFilesToRepo({
-          config: ghConfig,
-          modelKey: entry.key,
-          files,
-          onProgress: applyProgress,
-        });
-        if (modelLibDirHandle) sendModelLibraryToWorker();
-      }
-    }
-
-    // Optional: also keep a local library copy when only folder was requested
-    // or when workflow path skipped local write
-    if (modelLibDirHandle && !githubResult?.mode) {
-      // already written in fallback above
-    } else if (modelLibDirHandle && githubResult?.mode === "workflow") {
-      // Still download to local folder for offline use
-      await downloadEntryFiles({
-        modelKey: entry.key,
-        libraryRoot: modelLibDirHandle,
-        layout: getModelLibLayout(),
-        returnBuffers: false,
-        onProgress: applyProgress,
-      });
-      sendModelLibraryToWorker();
-      await refreshModelLibScan();
-    } else if (!wantGithub && modelLibDirHandle) {
-      await downloadEntryFiles({
-        modelKey: entry.key,
-        libraryRoot: modelLibDirHandle,
-        layout: getModelLibLayout(),
-        returnBuffers: false,
-        onProgress: applyProgress,
-      });
-      sendModelLibraryToWorker();
-      await refreshModelLibScan();
-    }
-
+    await downloadEntryFiles({
+      modelKey: entry.key,
+      libraryRoot: modelLibDirHandle,
+      layout: getModelLibLayout(),
+      returnBuffers: false,
+      onProgress: applyProgress,
+    });
+    sendModelLibraryToWorker();
+    await refreshModelLibScan();
     modelDownloadStatus.set(entry.key, true);
     await refreshModelDownloadStatus();
-
-    const parts = [];
-    if (modelLibDirHandle) parts.push(`folder “${modelLibDirHandle.name}”`);
-    if (githubResult?.mode === "workflow") {
-      parts.push(`GitHub Action (repo ${ghConfig.owner}/${ghConfig.repo})`);
-    } else if (githubResult?.uploaded) {
-      parts.push(
-        `GitHub (${githubResult.uploaded.length} files${
-          githubResult.skipped?.length
-            ? `, ${githubResult.skipped.length} skipped — over 100MB`
-            : ""
-        })`,
-      );
-    }
     setStatus(
-      `${entry.shortLabel} → ${parts.join(" and ") || "saved"}.${
-        githubResult
-          ? " Check Actions; Pages will redeploy when the model commit lands."
-          : ""
-      } Select the model in the list to load it from your folder (no auto-load).`,
+      `${entry.shortLabel} saved in “${modelLibDirHandle.name}”. Select it in the list to load.`,
       "success",
     );
   } catch (err) {
     console.error(err);
-    // Dev fallback: Vite API writes into public/models (local only)
-    if (import.meta.env.DEV && modelLibDirHandle == null && !wantGithub) {
+    if (import.meta.env.DEV) {
       try {
         await downloadModelViaDevApi(entry, applyProgress);
         modelDownloadStatus.set(entry.key, true);
@@ -609,73 +496,12 @@ async function downloadModelToDisk(key) {
         setStatus(err?.message || e2?.message || "Download failed.", "error");
       }
     } else {
-      const msg = err?.message || "Download failed.";
-      if (/workflow|Resource not accessible|403|401/i.test(msg)) {
-        setStatus(
-          `${msg} — Token needs repo + workflow scopes. Create one at github.com/settings/tokens`,
-          "error",
-        );
-      } else {
-        setStatus(msg, "error");
-      }
+      setStatus(err?.message || "Download failed.", "error");
     }
   } finally {
     modelDownloadingKey = null;
     updateModelDownloadIcons();
   }
-}
-
-function openGithubSettingsForToken() {
-  const details = document.getElementById("save-settings");
-  if (details) details.open = true;
-  if (els.githubSaveEnabled) {
-    els.githubSaveEnabled.checked = true;
-    persistGithubModelsForm();
-  }
-  if (els.githubModelsFields) els.githubModelsFields.hidden = false;
-  loadGithubModelsForm();
-  els.githubToken?.focus();
-  els.githubToken?.scrollIntoView({ behavior: "smooth", block: "center" });
-}
-
-function loadGithubModelsForm() {
-  const cfg = loadGithubModelsConfig();
-  if (els.githubSaveEnabled) els.githubSaveEnabled.checked = cfg.enabled;
-  if (els.githubOwner) els.githubOwner.value = cfg.owner;
-  if (els.githubRepo) els.githubRepo.value = cfg.repo;
-  if (els.githubBranch) els.githubBranch.value = cfg.branch;
-  if (els.githubToken) els.githubToken.value = cfg.token;
-  if (els.githubModelsFields) {
-    els.githubModelsFields.hidden = !cfg.enabled;
-  }
-  updateGithubModelsHint(cfg);
-}
-
-function persistGithubModelsForm() {
-  if (!els.githubSaveEnabled) return loadGithubModelsConfig();
-  return saveGithubModelsConfig({
-    enabled: els.githubSaveEnabled.checked,
-    owner: els.githubOwner?.value || "knullolctu",
-    repo: els.githubRepo?.value || "knull-and-clear",
-    branch: els.githubBranch?.value || "master",
-    token: els.githubToken?.value || "",
-  });
-}
-
-/** @param {import("./githubRepoModels.js").GithubModelsConfig} [cfg] */
-function updateGithubModelsHint(cfg = loadGithubModelsConfig()) {
-  if (!els.githubModelsHint) return;
-  if (!cfg.enabled) {
-    els.githubModelsHint.textContent =
-      "When enabled, Download saves the model into your GitHub repo (Action downloads + commits public/models/).";
-    return;
-  }
-  if (!cfg.token) {
-    els.githubModelsHint.textContent =
-      "Required once: classic PAT with repo + workflow scopes (or fine-grained Actions + Contents write). Stored only in this browser.";
-    return;
-  }
-  els.githubModelsHint.textContent = `Ready → Download starts Action on https://github.com/${cfg.owner}/${cfg.repo} (branch ${cfg.branch}) to commit models.`;
 }
 
 /**
@@ -1669,7 +1495,6 @@ function loadLocalSettings() {
   } catch {
     els.filenamePrefix.value = "knull-clear";
   }
-  loadGithubModelsForm();
 }
 
 function bindEvents() {
@@ -1805,28 +1630,6 @@ function bindEvents() {
       showOverlay("Reloading model with new layout…");
     }
   });
-
-  els.githubSaveEnabled?.addEventListener("change", () => {
-    if (els.githubModelsFields) {
-      els.githubModelsFields.hidden = !els.githubSaveEnabled.checked;
-    }
-    const cfg = persistGithubModelsForm();
-    updateGithubModelsHint(cfg);
-    updateModelDownloadIcons();
-  });
-  for (const input of [
-    els.githubOwner,
-    els.githubRepo,
-    els.githubBranch,
-    els.githubToken,
-  ]) {
-    input?.addEventListener("change", () => {
-      updateGithubModelsHint(persistGithubModelsForm());
-    });
-    input?.addEventListener("blur", () => {
-      updateGithubModelsHint(persistGithubModelsForm());
-    });
-  }
 
   els.filenamePrefix.addEventListener("change", () => {
     try {
