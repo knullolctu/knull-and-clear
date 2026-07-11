@@ -76,51 +76,40 @@ async function readLibraryAbsolute(relativePath) {
 }
 
 /**
- * A model pack: tokenizer + config + onnx weights (any nesting under library).
+ * A model pack folder: has onnx weights (sidecars may be incomplete).
  * @param {FileSystemDirectoryHandle} dir
  */
 async function isPackDir(dir) {
-  let hasConfig = false;
-  let hasTokenizer = false;
-  let hasOnnx = false;
-  try {
-    await dir.getFileHandle("config.json");
-    hasConfig = true;
-  } catch {
-    /* optional soft */
-  }
-  try {
-    await dir.getFileHandle("tokenizer.json");
-    hasTokenizer = true;
-  } catch {
-    /* optional soft */
-  }
   try {
     const onnx = await dir.getDirectoryHandle("onnx");
     for await (const [name, h] of onnx.entries()) {
-      if (h.kind === "file" && name.endsWith(".onnx")) {
-        hasOnnx = true;
-        break;
-      }
+      if (h.kind === "file" && name.endsWith(".onnx")) return true;
     }
   } catch {
-    /* no onnx dir */
+    /* no onnx/ */
   }
-  // Also accept .onnx sitting next to config (rare)
-  if (!hasOnnx) {
-    try {
-      for await (const [name, h] of dir.entries()) {
-        if (h.kind === "file" && name.endsWith(".onnx")) {
-          hasOnnx = true;
-          break;
-        }
-      }
-    } catch {
-      /* ignore */
+  try {
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind === "file" && name.endsWith(".onnx")) return true;
     }
+  } catch {
+    /* ignore */
   }
-  // Need weights + at least one of the json sidecars
-  return hasOnnx && (hasConfig || hasTokenizer);
+  return false;
+}
+
+/**
+ * @param {FileSystemDirectoryHandle} dir
+ * @param {string} fileName
+ */
+async function packHasFile(dir, fileName) {
+  try {
+    const fh = await dir.getFileHandle(fileName);
+    const f = await fh.getFile();
+    return f.size > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -201,10 +190,20 @@ async function resolvePackDir(modelId) {
   if (packDirCache.has(modelId)) return packDirCache.get(modelId);
 
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
-  const short = id.split("/").pop() || id;
+  const segments = id.split("/").filter(Boolean);
+  const short = segments[segments.length - 1] || id;
+  const org = segments.length >= 2 ? segments[0] : "";
+  // If user selected the org folder itself (e.g. "onnx-community") as library root
+  const rootIsOrg =
+    org &&
+    (modelLibraryRoot.name === org ||
+      modelLibraryRoot.name.toLowerCase() === org.toLowerCase());
 
   const tryRel = async (rel) => {
     try {
+      if (!rel) {
+        return (await isPackDir(modelLibraryRoot)) ? modelLibraryRoot : null;
+      }
       const parts = rel.split("/").filter(Boolean);
       let dir = modelLibraryRoot;
       for (const p of parts) dir = await dir.getDirectoryHandle(p);
@@ -215,22 +214,21 @@ async function resolvePackDir(modelId) {
     return null;
   };
 
-  // Fast exact relative paths
-  for (const rel of [
+  // Fast paths — order matters for common layouts
+  const fast = [
+    // library root = onnx-community → child Kokoro-…
+    rootIsOrg ? short : null,
     `models/${id}`,
     id,
     `models/${short}`,
     short,
-    // user picked the pack folder itself
-    "",
-  ]) {
-    if (rel === "") {
-      if (await isPackDir(modelLibraryRoot)) {
-        packDirCache.set(modelId, modelLibraryRoot);
-        return modelLibraryRoot;
-      }
-      continue;
-    }
+    // library root = models → onnx-community/Kokoro-…
+    org ? `${org}/${short}` : null,
+    `models/${org}/${short}`,
+    "", // root is the pack
+  ].filter(Boolean);
+
+  for (const rel of fast) {
     const hit = await tryRel(rel);
     if (hit) {
       packDirCache.set(modelId, hit);
@@ -245,15 +243,16 @@ async function resolvePackDir(modelId) {
   let best = null;
   let bestScore = 0;
   for (const p of packs) {
-    const s = packMatchScore(p.path, p.name, id);
+    let s = packMatchScore(p.path, p.name, id);
+    // Boost when library root is the org folder and child name matches short
+    if (rootIsOrg && p.name.toLowerCase() === short.toLowerCase()) s += 60;
     if (s > bestScore) {
       bestScore = s;
       best = p;
     }
   }
 
-  // Only accept a reasonable match, or the sole pack in the library
-  if (best && (bestScore >= 25 || packs.length === 1)) {
+  if (best && (bestScore >= 15 || packs.length === 1)) {
     packDirCache.set(modelId, best.handle);
     return best.handle;
   }
@@ -1194,13 +1193,13 @@ async function assertModelFilesPresent() {
     );
   }
 
-  // Clear cache so a fresh Download is visible
+  // Clear cache so a fresh Download / re-scan is visible
   packDirCache.delete(MODEL_ID);
+  packDirCache.clear();
 
   const pack = await resolvePackDir(MODEL_ID);
   const needed = ["tokenizer.json", "config.json", "tokenizer_config.json"];
   const missing = [];
-  const found = [];
 
   for (const f of needed) {
     let buf = null;
@@ -1208,8 +1207,7 @@ async function assertModelFilesPresent() {
     if (!buf || buf.byteLength === 0) {
       buf = await readFromModelLibrary(MODEL_ID, f);
     }
-    if (buf && buf.byteLength > 0) found.push(f);
-    else missing.push(f);
+    if (!buf || buf.byteLength === 0) missing.push(f);
   }
 
   if (missing.length === 0) return;
@@ -1217,20 +1215,26 @@ async function assertModelFilesPresent() {
   const packs = await listAllPacks();
   const packHint =
     packs.length > 0
-      ? ` Found pack folder(s): ${packs
-          .slice(0, 5)
-          .map((p) => p.path || p.name)
-          .join(", ")}${packs.length > 5 ? "…" : ""}.`
-      : " No model pack folders found under your library (need config/tokenizer + onnx/).";
+      ? ` Located pack folder(s): ${packs
+          .slice(0, 6)
+          .map((p) => (p.path ? p.path : p.name))
+          .join(", ")}.`
+      : ` Library root is “${modelLibraryRoot.name}”. No onnx/ folders found under it.`;
 
   if (!pack) {
     throw new Error(
-      `Could not locate pack “${MODEL_ID}” under your library.${packHint} Pick the parent folder that contains models/, or Download “${activeModel.shortLabel}”.`,
+      `Could not locate pack “${MODEL_ID}”.${packHint} Tip: choose the folder that contains “Kokoro-82M-v1.0-ONNX”, or its parent (e.g. onnx-community or models). Or Download “${activeModel.shortLabel}”.`,
     );
   }
 
+  // Pack has weights but incomplete JSON sidecars — common if only .onnx was copied
+  const hasTok = await packHasFile(pack, "tokenizer.json");
+  const hasCfg = await packHasFile(pack, "config.json");
   throw new Error(
-    `Pack found but incomplete for ${MODEL_ID}. Missing: ${missing.join(", ")}.${packHint} Use Download on “${activeModel.shortLabel}” to fill tokenizer/config.`,
+    `Found pack under your library but incomplete (missing ${missing.join(", ")}).` +
+      ` Weights-only folders need tokenizer.json + config.json + tokenizer_config.json next to onnx/.` +
+      ` Use Download on “${activeModel.shortLabel}” to fetch the missing JSON files.${packHint}` +
+      (hasTok || hasCfg ? "" : " (No tokenizer/config next to onnx/ yet.)"),
   );
 }
 

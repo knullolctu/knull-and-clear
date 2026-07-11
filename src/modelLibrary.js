@@ -112,45 +112,23 @@ export async function libraryFileSize(root, relativePath) {
  * @param {FileSystemDirectoryHandle} dir
  */
 export async function isModelPackDir(dir) {
-  let hasConfig = false;
-  let hasTokenizer = false;
-  let hasOnnx = false;
-  try {
-    await dir.getFileHandle("config.json");
-    hasConfig = true;
-  } catch {
-    /* */
-  }
-  try {
-    await dir.getFileHandle("tokenizer.json");
-    hasTokenizer = true;
-  } catch {
-    /* */
-  }
+  // Weights folder is enough to locate a pack (JSON sidecars checked separately)
   try {
     const onnx = await dir.getDirectoryHandle("onnx");
     for await (const [name, handle] of onnx.entries()) {
-      if (handle.kind === "file" && name.endsWith(".onnx")) {
-        hasOnnx = true;
-        break;
-      }
+      if (handle.kind === "file" && name.endsWith(".onnx")) return true;
     }
   } catch {
     /* */
   }
-  if (!hasOnnx) {
-    try {
-      for await (const [name, handle] of dir.entries()) {
-        if (handle.kind === "file" && name.endsWith(".onnx")) {
-          hasOnnx = true;
-          break;
-        }
-      }
-    } catch {
-      /* */
+  try {
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === "file" && name.endsWith(".onnx")) return true;
     }
+  } catch {
+    /* */
   }
-  return hasOnnx && (hasConfig || hasTokenizer);
+  return false;
 }
 
 /**
@@ -212,17 +190,24 @@ export async function resolveModelPackDir(root, modelId) {
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
   const segments = id.split("/").filter(Boolean);
   const short = segments[segments.length - 1] || id;
+  const org = segments.length >= 2 ? segments[0] : "";
+  const rootIsOrg =
+    org &&
+    (root.name === org || root.name.toLowerCase() === org.toLowerCase());
 
   // Root itself is the pack
   if (await isModelPackDir(root)) return root;
 
-  // Fast path: fixed write locations
+  // Fast path: fixed write locations + org-as-root
   const directPaths = [
+    rootIsOrg ? short : null,
     `${LIBRARY_MODELS_PREFIX}/${id}`,
     id,
     short,
     `${LIBRARY_MODELS_PREFIX}/${short}`,
-  ];
+    org ? `${org}/${short}` : null,
+    `${LIBRARY_MODELS_PREFIX}/${org}/${short}`,
+  ].filter(Boolean);
   for (const rel of directPaths) {
     try {
       const parts = rel.split("/").filter(Boolean);
@@ -248,6 +233,7 @@ export async function resolveModelPackDir(root, modelId) {
     if (path.endsWith(`/${id}`) || path.endsWith(id)) score += 80;
     if (path.includes(id)) score += 50;
     if (name === short || name.toLowerCase() === short.toLowerCase()) score += 40;
+    if (rootIsOrg && name.toLowerCase() === short.toLowerCase()) score += 60;
     if (path.toLowerCase().includes(short.toLowerCase())) score += 25;
     if (segments[0] && path.includes(segments[0])) score += 10;
     if (/kokoro/i.test(name) && /kokoro/i.test(short)) score += 15;
@@ -256,7 +242,7 @@ export async function resolveModelPackDir(root, modelId) {
       best = p;
     }
   }
-  return bestScore >= 25 && best ? best.handle : null;
+  return bestScore >= 15 && best ? best.handle : null;
 }
 
 /**
@@ -338,22 +324,16 @@ export async function listLibraryModelIds(root) {
  */
 export async function isEntryInLibrary(root, entry) {
   const onnx = onnxFileForDtype(entry.dtype);
-  // Exact dtype file first; min size 5MB (q4/fp32 exports vary a lot)
-  const files = [`onnx/${onnx}`, "onnx/model_quantized.onnx", "onnx/model.onnx"];
-  for (const f of files) {
-    const buf = await readLibraryModelFile(root, entry.modelId, f);
-    if (buf && buf.byteLength >= 5_000_000) {
-      // Prefer exact name match for "present"
-      if (f === `onnx/${onnx}`) return true;
-    }
-  }
-  // Exact file only for catalog "downloaded" badge
+  // Ready only if weights AND tokenizer/config exist (can actually load)
   const exact = await readLibraryModelFile(
     root,
     entry.modelId,
     `onnx/${onnx}`,
   );
-  return Boolean(exact && exact.byteLength >= 5_000_000);
+  if (!exact || exact.byteLength < 5_000_000) return false;
+  const tok = await readLibraryModelFile(root, entry.modelId, "tokenizer.json");
+  const cfg = await readLibraryModelFile(root, entry.modelId, "config.json");
+  return Boolean(tok && tok.byteLength > 0 && cfg && cfg.byteLength > 0);
 }
 
 /**

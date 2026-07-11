@@ -597,14 +597,14 @@ async function refreshModelLibScan() {
     const missing = scan.models.filter((m) => !m.present).map((m) => m.shortLabel);
     const lines = [
       `Root: ${modelLibDirHandle.name}/ (scans nested folders)`,
-      present.length
-        ? `Ready: ${present.join(", ")}`
-        : "Ready: (none — use Download, or point at a folder that already has a pack)",
       scan.packPaths?.length
         ? `Located packs: ${scan.packPaths.slice(0, 8).join(", ")}${scan.packPaths.length > 8 ? "…" : ""}`
-        : "Located packs: (none — need a folder with tokenizer/config + onnx/)",
-      missing.length && present.length < missing.length
-        ? `Not ready: ${missing.join(", ")}`
+        : "Located packs: (none — need a folder with onnx/*.onnx)",
+      present.length
+        ? `Loadable: ${present.join(", ")}`
+        : "Loadable: (none — need tokenizer.json + config.json + onnx weights)",
+      missing.length
+        ? `Incomplete / missing: ${missing.join(", ")} — use Download`
         : null,
     ].filter(Boolean);
     els.modelLibScan.hidden = false;
