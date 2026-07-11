@@ -600,8 +600,22 @@ async function detectWebGPU() {
  * Vite/GitHub Pages can return 200 + index.html for missing paths, which
  * would otherwise make HEAD checks lie and cause protobuf parse errors.
  */
+/**
+ * Infer dtype from onnx filename for size checks.
+ * @param {string} urlOrPath
+ */
+function dtypeFromOnnxPath(urlOrPath) {
+  const s = String(urlOrPath);
+  if (/model_q4f16/i.test(s)) return "q4f16";
+  if (/model_q4/i.test(s)) return "q4";
+  if (/model_fp16/i.test(s)) return "fp16";
+  if (/model_quantized/i.test(s)) return "q8";
+  if (/model\.onnx/i.test(s)) return "fp32";
+  return "q8";
+}
+
 async function existsOnnx(url) {
-  // Prefer user library (layout-aware) when URL maps to /models/{id}/onnx/file
+  // Prefer user library when URL maps to /models/{id}/onnx/file
   if (modelLibraryRoot) {
     try {
       const u = new URL(url, self.location.origin);
@@ -609,7 +623,11 @@ async function existsOnnx(url) {
       if (m) {
         const fullRel = decodeURIComponent(m[1]);
         const buf = await readFromModelLibraryPath(fullRel);
-        if (buf && buf.byteLength >= 1_000_000) return true;
+        if (buf && weightSizeOk(dtypeFromOnnxPath(fullRel), buf.byteLength)) {
+          return true;
+        }
+        // Wrong-sized file must not count as a hit (avoids loading q8 as fp32)
+        if (buf && buf.byteLength >= 1_000_000) return false;
       }
     } catch {
       /* fall through */
@@ -626,6 +644,7 @@ async function existsOnnx(url) {
     const len = Number(res.headers.get("content-length") || 0);
     // Kokoro weights are tens of MB; index.html is a few KB.
     if (len > 0 && len < 1_000_000) return false;
+    if (len > 0 && !weightSizeOk(dtypeFromOnnxPath(url), len)) return false;
 
     // Empty Content-Length + no binary type → verify magic via range GET.
     if (!len) {
@@ -734,7 +753,7 @@ async function pickRuntime(preferWebGPU) {
     ]) {
       for (const id of [MODEL_ID, V1_MODEL_ID]) {
         const buf = await readFromModelLibrary(id, `onnx/${file}`);
-        if (buf && buf.byteLength >= 1_000_000) {
+        if (buf && weightSizeOk(dtype, buf.byteLength)) {
           if (id !== MODEL_ID) {
             MODEL_ID = id;
             MODEL_BASE = new URL(
@@ -752,16 +771,78 @@ async function pickRuntime(preferWebGPU) {
     }
   }
 
+  // fp32 requested but missing/invalid — fall back to q8 rather than bad audio
+  if (wanted === "fp32" || wanted === "q4") {
+    for (const id of [MODEL_ID, V1_MODEL_ID]) {
+      const q8buf = modelLibraryRoot
+        ? await readFromModelLibrary(id, "onnx/model_quantized.onnx")
+        : null;
+      if (q8buf && weightSizeOk("q8", q8buf.byteLength)) {
+        if (id !== MODEL_ID) {
+          MODEL_ID = id;
+          MODEL_BASE = new URL(
+            `models/${id}/`,
+            self.location.origin + BASE_URL,
+          ).pathname.replace(/\/?$/, "/");
+        }
+        return {
+          device: "wasm",
+          dtype: "q8",
+          source: `library-q8-fallback-from-${wanted}`,
+        };
+      }
+      if (await existsOnnx(`${new URL(`models/${id}/`, self.location.origin + BASE_URL).pathname.replace(/\/?$/, "/")}onnx/model_quantized.onnx`)) {
+        MODEL_ID = id;
+        MODEL_BASE = new URL(
+          `models/${id}/`,
+          self.location.origin + BASE_URL,
+        ).pathname.replace(/\/?$/, "/");
+        return {
+          device: "wasm",
+          dtype: "q8",
+          source: `local-q8-fallback-from-${wanted}`,
+        };
+      }
+    }
+  }
+
   throw new Error(
-    "No local model weights found. Open Storage → choose a model library folder (or host models under /models/), then Download the pack you need. Online Hugging Face loading is disabled.",
+    "No local model weights found. Open Storage → choose a model library folder, Download Balanced (q8) or High quality (fp32 model.onnx ~310MB), then load again.",
   );
+}
+
+/**
+ * Sanity-check ONNX file size for a dtype so we don't load the wrong blob
+ * (e.g. a 90MB q8 file as "fp32", or a 310MB fp32 file as "q4").
+ * @param {string} dtype
+ * @param {number} bytes
+ */
+function weightSizeOk(dtype, bytes) {
+  if (!Number.isFinite(bytes) || bytes < 1_000_000) return false;
+  const mb = bytes / (1024 * 1024);
+  switch (dtype) {
+    case "fp32":
+      // Full precision Kokoro ~300–330 MB
+      return mb >= 200 && mb <= 450;
+    case "fp16":
+      return mb >= 80 && mb <= 250;
+    case "q4":
+    case "q4f16":
+      // True q4 is typically ~40–100 MB — reject huge mislabeled files
+      return mb >= 20 && mb <= 160;
+    case "q8":
+    default:
+      return mb >= 25 && mb <= 160;
+  }
 }
 
 /** Split long text so each chunk stays within Kokoro's comfortable length. */
 const SENTENCE_SPLIT = /(?<=[.!?…])\s+|\n+/;
 
 /**
- * Coerce kokoro / transformers audio output to a plain Float32Array.
+ * Coerce kokoro / transformers audio output to a *owned* Float32Array copy.
+ * Always copy — ORT/transformers may reuse the underlying buffer on the next
+ * generate() (esp. with large fp32 sessions), which garbles multi-chunk audio.
  * @param {unknown} audioOut
  * @returns {{ samples: Float32Array, sampleRate: number }}
  */
@@ -778,27 +859,56 @@ function extractAudio(audioOut) {
     audioOut?.array ??
     audioOut;
 
-  // Nested tensor-like: { data: Float32Array } or TypedArray
-  if (raw && !(raw instanceof Float32Array) && raw.data) {
+  // Nested tensor-like: { data: TypedArray }
+  if (raw && typeof raw === "object" && raw.data && !ArrayBuffer.isView(raw)) {
     raw = raw.data;
   }
 
+  /** @type {Float32Array} */
   let samples;
   if (raw instanceof Float32Array) {
-    samples = raw;
-  } else if (ArrayBuffer.isView(raw)) {
-    // Copy into Float32 view of the underlying buffer carefully
-    samples = new Float32Array(
-      raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength),
-    );
-  } else if (Array.isArray(raw)) {
+    samples = new Float32Array(raw); // defensive copy
+  } else if (typeof Float16Array !== "undefined" && raw instanceof Float16Array) {
     samples = Float32Array.from(raw);
+  } else if (raw instanceof Float64Array) {
+    samples = Float32Array.from(raw);
+  } else if (raw instanceof Int16Array) {
+    samples = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i++) samples[i] = raw[i] / 32768;
+  } else if (raw instanceof Int32Array) {
+    samples = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i++) samples[i] = raw[i] / 2147483648;
+  } else if (ArrayBuffer.isView(raw)) {
+    // Unknown typed array — convert via number values, never reinterpret bits
+    samples = Float32Array.from(raw);
+  } else if (Array.isArray(raw)) {
+    samples = Float32Array.from(raw, (v) => Number(v) || 0);
   } else {
     throw new Error("Model returned unexpected audio format.");
   }
 
   if (!samples.length) {
     throw new Error("Model returned empty audio.");
+  }
+
+  // Reject NaN/Inf (broken fp32 sessions often spit these)
+  let nan = 0;
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i];
+    if (!Number.isFinite(v)) nan++;
+    else {
+      const a = Math.abs(v);
+      if (a > peak) peak = a;
+    }
+  }
+  if (nan > samples.length * 0.01) {
+    throw new Error(
+      "Model produced invalid audio (NaN). Try Balanced (q8), or re-download High quality weights.",
+    );
+  }
+  if (peak < 1e-7) {
+    throw new Error("Model produced silent audio. Weights may be wrong for this dtype.");
   }
 
   return { samples, sampleRate: rate > 0 ? rate : 24000 };
@@ -1054,9 +1164,11 @@ let pendingModelKey = null;
 let loadGeneration = 0;
 
 async function loadModel(device, dtype) {
+  // Always pin wasm for speech quality unless webgpu was explicitly chosen.
+  const dev = device === "webgpu" ? "webgpu" : "wasm";
   return KokoroTTS.from_pretrained(MODEL_ID, {
     dtype,
-    device,
+    device: dev,
     progress_callback: onProgress,
   });
 }
