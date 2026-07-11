@@ -229,6 +229,19 @@
                 ></div>
                 <input type="hidden" id="voice-select" value="af_heart" />
               </div>
+              <div class="voice-download-row" id="voice-download-row">
+                <button
+                  type="button"
+                  id="download-voices-btn"
+                  class="btn btn-secondary btn-sm"
+                >
+                  Download voices
+                </button>
+                <span id="voice-download-progress" class="hint voice-download-progress" hidden></span>
+              </div>
+              <p class="hint" id="voice-download-hint">
+                Saves English voice packs into your library under <code>voices/*.bin</code> (e.g. af_nicole).
+              </p>
             </div>
 
             <div class="control control-speed">

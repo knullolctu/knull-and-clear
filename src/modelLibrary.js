@@ -392,6 +392,92 @@ export async function writeLibraryFile(root, relativePath, data) {
 }
 
 /**
+ * Download English voice .bin packs into {root}/models/{modelId}/voices/.
+ * @param {object} opts
+ * @param {FileSystemDirectoryHandle} opts.libraryRoot
+ * @param {string} [opts.modelId]
+ * @param {string[]} [opts.voiceIds] defaults to ENGLISH_VOICES
+ * @param {(ev: object) => void} [opts.onProgress]
+ */
+export async function downloadVoicesToLibrary({
+  libraryRoot,
+  modelId = "onnx-community/Kokoro-82M-v1.0-ONNX",
+  voiceIds = ENGLISH_VOICES,
+  onProgress,
+}) {
+  if (!libraryRoot) {
+    throw new Error("Choose a model library folder first.");
+  }
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  const voices = voiceIds?.length ? voiceIds : ENGLISH_VOICES;
+  let saved = 0;
+  let skipped = 0;
+
+  onProgress?.({
+    type: "start",
+    message: `Downloading ${voices.length} voices for ${id}…`,
+  });
+
+  for (let i = 0; i < voices.length; i++) {
+    const voice = voices[i];
+    const rel = `voices/${voice}.bin`;
+    const dest = pathInLibrary(id, rel);
+
+    // Skip if already present (nested-aware read)
+    const existing = await readLibraryModelFile(libraryRoot, id, rel);
+    if (existing && existing.byteLength > 1000) {
+      skipped++;
+      onProgress?.({
+        type: "skip",
+        file: rel,
+        index: i + 1,
+        count: voices.length,
+        message: `Skip ${voice} (already present)`,
+      });
+      continue;
+    }
+
+    const url = `https://huggingface.co/${id}/resolve/main/${rel}`;
+    onProgress?.({
+      type: "start",
+      file: rel,
+      index: i + 1,
+      count: voices.length,
+      message: `Downloading voice ${voice}… (${i + 1}/${voices.length})`,
+    });
+
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`Failed voice ${voice}: HTTP ${res.status}`);
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength < 1000) {
+      throw new Error(`Voice ${voice} file too small (${buf.byteLength} B)`);
+    }
+    await writeLibraryFile(libraryRoot, dest, buf);
+    saved++;
+    onProgress?.({
+      type: "file-done",
+      file: rel,
+      index: i + 1,
+      count: voices.length,
+      loaded: buf.byteLength,
+      total: buf.byteLength,
+      message: `Saved ${voice}`,
+    });
+  }
+
+  onProgress?.({
+    type: "complete",
+    message: `Voices ready: ${saved} downloaded, ${skipped} already present.`,
+    saved,
+    skipped,
+  });
+
+  return { saved, skipped, modelId: id };
+}
+
+/**
  * Download into fixed {root}/models/{modelId}/… (creates nested folders).
  *
  * @param {object} opts

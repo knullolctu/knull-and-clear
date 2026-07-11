@@ -496,7 +496,7 @@ async function fetchVoiceBuffer(fileName) {
     }
 
     throw new Error(
-      `Voice "${fileName.replace(/\.bin$/, "")}" not in your library. Download the model pack (includes voices/).`,
+      `Voice "${fileName.replace(/\.bin$/, "")}" not in your library. Click “Download voices” under Voice, then Generate again.`,
     );
   })();
 
@@ -1395,6 +1395,20 @@ self.addEventListener("message", async (event) => {
   if (data.type === "set-model-library") {
     modelLibraryRoot = data.handle || null;
     packDirCache.clear();
+    return;
+  }
+
+  if (data.type === "clear-voice-cache") {
+    voiceMemory.clear();
+    voiceInflight.clear();
+    packDirCache.clear();
+    try {
+      if (typeof caches !== "undefined") {
+        await caches.delete("kokoro-voices");
+      }
+    } catch {
+      /* ignore */
+    }
     return;
   }
 

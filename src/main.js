@@ -10,9 +10,11 @@ import {
 } from "./modelCatalog.js";
 import {
   downloadEntryFiles,
+  downloadVoicesToLibrary,
   isEntryInLibrary,
   scanLibraryCatalog,
 } from "./modelLibrary.js";
+import { ENGLISH_VOICES } from "./modelCatalog.js";
 
 const STORAGE_KEYS = {
   filenamePrefix: "knullclear.filenamePrefix",
@@ -70,9 +72,15 @@ const els = {
   setupChooseFolderBtn: document.getElementById("setup-choose-folder-btn"),
   setupOpenStorageBtn: document.getElementById("setup-open-storage-btn"),
   setupModalError: document.getElementById("setup-modal-error"),
+  downloadVoicesBtn: document.getElementById("download-voices-btn"),
+  voiceDownloadProgress: document.getElementById("voice-download-progress"),
+  voiceDownloadHint: document.getElementById("voice-download-hint"),
   filenamePrefix: document.getElementById("filename-prefix"),
   autoSave: document.getElementById("auto-save"),
 };
+
+/** @type {boolean} */
+let voicesDownloading = false;
 
 /** @type {Worker | null} */
 let worker = null;
@@ -499,6 +507,92 @@ async function downloadModelToDisk(key) {
   } finally {
     modelDownloadingKey = null;
     updateModelDownloadIcons();
+  }
+}
+
+/**
+ * Download English voice .bin files into the local library for the active model.
+ */
+async function downloadVoicesForSelectedModel() {
+  if (voicesDownloading || modelDownloadingKey) {
+    setStatus("A download is already running.", "error");
+    return;
+  }
+  if (!modelLibDirHandle) {
+    const details = document.getElementById("save-settings");
+    if (details) details.open = true;
+    showSetupModal("Choose a model library folder first, then download voices.");
+    setStatus("Choose a model library folder under Storage first.", "error");
+    return;
+  }
+  if (!(await ensureDirPermission(modelLibDirHandle))) {
+    setStatus("Folder permission needed to save voices.", "error");
+    return;
+  }
+
+  const entry = getModelEntry(selectedModelKey);
+  voicesDownloading = true;
+  if (els.downloadVoicesBtn) {
+    els.downloadVoicesBtn.disabled = true;
+    els.downloadVoicesBtn.textContent = "Downloading voices…";
+  }
+  if (els.voiceDownloadProgress) {
+    els.voiceDownloadProgress.hidden = false;
+    els.voiceDownloadProgress.textContent = "Starting…";
+  }
+
+  const applyProgress = (ev) => {
+    const msg = ev.message || "Downloading voices…";
+    setStatus(msg);
+    if (els.voiceDownloadProgress) {
+      els.voiceDownloadProgress.hidden = false;
+      els.voiceDownloadProgress.textContent =
+        ev.index != null && ev.count
+          ? `${ev.index}/${ev.count} · ${msg}`
+          : msg;
+    }
+  };
+
+  try {
+    const result = await downloadVoicesToLibrary({
+      libraryRoot: modelLibDirHandle,
+      modelId: entry.modelId,
+      voiceIds: ENGLISH_VOICES,
+      onProgress: applyProgress,
+    });
+    // Also mirror voices onto v1 id if different (shared style packs)
+    if (entry.modelId !== "onnx-community/Kokoro-82M-v1.0-ONNX") {
+      await downloadVoicesToLibrary({
+        libraryRoot: modelLibDirHandle,
+        modelId: "onnx-community/Kokoro-82M-v1.0-ONNX",
+        voiceIds: ENGLISH_VOICES,
+        onProgress: applyProgress,
+      });
+    }
+    sendModelLibraryToWorker();
+    // Tell worker to drop cached voice misses
+    try {
+      worker?.postMessage({ type: "clear-voice-cache" });
+    } catch {
+      /* ignore */
+    }
+    await refreshModelLibScan();
+    setStatus(
+      `Voices ready for ${entry.shortLabel}: ${result.saved} new, ${result.skipped} already present. Try Generate again.`,
+      "success",
+    );
+  } catch (err) {
+    console.error(err);
+    setStatus(err?.message || "Voice download failed.", "error");
+  } finally {
+    voicesDownloading = false;
+    if (els.downloadVoicesBtn) {
+      els.downloadVoicesBtn.disabled = false;
+      els.downloadVoicesBtn.textContent = "Download voices";
+    }
+    if (els.voiceDownloadProgress) {
+      els.voiceDownloadProgress.hidden = true;
+    }
   }
 }
 
@@ -1578,6 +1672,11 @@ function bindEvents() {
   els.modelDownloadInline?.addEventListener("click", () => {
     downloadModelToDisk(selectedModelKey).catch((e) =>
       setStatus(e?.message || "Download failed.", "error"),
+    );
+  });
+  els.downloadVoicesBtn?.addEventListener("click", () => {
+    downloadVoicesForSelectedModel().catch((e) =>
+      setStatus(e?.message || "Voice download failed.", "error"),
     );
   });
 

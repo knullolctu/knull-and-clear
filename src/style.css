@@ -577,6 +577,19 @@ button.linkish:hover {
   flex-shrink: 0;
 }
 
+.voice-download-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+}
+
+.voice-download-progress {
+  margin: 0 !important;
+  flex: 1 1 140px;
+}
+
 .model-download-btn {
   padding: 0.28rem 0.55rem !important;
   font-size: 0.72rem !important;
