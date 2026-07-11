@@ -214,9 +214,70 @@
                   </button>
                 </div>
                 <p class="hint" id="model-lib-hint">
-                  Chrome / Edge: pick a folder on your PC for TTS weights. Download stores models
-                  there; the GitHub site stays app-only.
+                  Chrome / Edge: pick a folder on your PC for TTS weights (optional if GitHub save is on).
                 </p>
+              </div>
+              <div class="control github-models-control">
+                <label class="check-card" for="github-save-enabled">
+                  <input id="github-save-enabled" type="checkbox" />
+                  <span>
+                    <strong>Save downloads to GitHub repo</strong>
+                    <small>Commit model files under public/models/ so Pages can host them</small>
+                  </span>
+                </label>
+                <div class="github-models-fields" id="github-models-fields" hidden>
+                  <div class="settings-grid github-repo-grid">
+                    <div class="control">
+                      <label class="field-label" for="github-owner">Owner</label>
+                      <input
+                        id="github-owner"
+                        class="text-input text-input-sm"
+                        type="text"
+                        spellcheck="false"
+                        autocomplete="off"
+                        placeholder="knullolctu"
+                      />
+                    </div>
+                    <div class="control">
+                      <label class="field-label" for="github-repo">Repo</label>
+                      <input
+                        id="github-repo"
+                        class="text-input text-input-sm"
+                        type="text"
+                        spellcheck="false"
+                        autocomplete="off"
+                        placeholder="knull-and-clear"
+                      />
+                    </div>
+                    <div class="control">
+                      <label class="field-label" for="github-branch">Branch</label>
+                      <input
+                        id="github-branch"
+                        class="text-input text-input-sm"
+                        type="text"
+                        spellcheck="false"
+                        autocomplete="off"
+                        placeholder="master"
+                      />
+                    </div>
+                    <div class="control">
+                      <label class="field-label" for="github-token">Token</label>
+                      <input
+                        id="github-token"
+                        class="text-input text-input-sm"
+                        type="password"
+                        spellcheck="false"
+                        autocomplete="off"
+                        placeholder="ghp_… (repo write)"
+                      />
+                    </div>
+                  </div>
+                  <p class="hint" id="github-models-hint">
+                    Paste a fine-grained token with Contents read/write on this repo (or classic
+                    <code>repo</code> scope). Token stays in this browser only. Files over ~100&nbsp;MB
+                    cannot be uploaded via the API.
+                  </p>
+                </div>
               </div>
               <div class="control">
                 <span class="field-label">Audio save folder</span>

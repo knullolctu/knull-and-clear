@@ -72,15 +72,28 @@ export async function writeLibraryFile(root, relativePath, data) {
 }
 
 /**
- * Download catalog model files from Hugging Face into the user library folder.
- * @param {FileSystemDirectoryHandle} root
- * @param {string} modelKey
- * @param {(ev: object) => void} [onProgress]
+ * Download catalog model files from Hugging Face.
+ * Optionally writes into the user library folder and/or returns buffers
+ * for GitHub upload.
+ *
+ * @param {object} opts
+ * @param {string} opts.modelKey
+ * @param {FileSystemDirectoryHandle} [opts.libraryRoot]
+ * @param {boolean} [opts.returnBuffers=false]
+ * @param {(ev: object) => void} [opts.onProgress]
+ * @returns {Promise<{ path: string, data: ArrayBuffer }[]>}
  */
-export async function downloadEntryToLibrary(root, modelKey, onProgress) {
+export async function downloadEntryFiles({
+  modelKey,
+  libraryRoot = null,
+  returnBuffers = false,
+  onProgress,
+}) {
   const entry = getModelEntry(modelKey);
   const files = filesForModelEntry(entry);
   const modelId = entry.modelId;
+  /** @type {{ path: string, data: ArrayBuffer }[]} */
+  const collected = [];
 
   onProgress?.({
     type: "start",
@@ -91,7 +104,7 @@ export async function downloadEntryToLibrary(root, modelKey, onProgress) {
     const rel = files[i];
     const dest = `${modelId}/${rel}`;
 
-    if (await libraryFileExists(root, dest)) {
+    if (libraryRoot && (await libraryFileExists(libraryRoot, dest))) {
       onProgress?.({
         type: "skip",
         file: rel,
@@ -99,6 +112,17 @@ export async function downloadEntryToLibrary(root, modelKey, onProgress) {
         index: i + 1,
         count: files.length,
       });
+      if (returnBuffers) {
+        try {
+          const fh = await resolveFileHandle(libraryRoot, dest, {
+            create: false,
+          });
+          const file = await fh.getFile();
+          collected.push({ path: rel, data: await file.arrayBuffer() });
+        } catch {
+          /* ignore read failure for skip */
+        }
+      }
       continue;
     }
 
@@ -117,6 +141,7 @@ export async function downloadEntryToLibrary(root, modelKey, onProgress) {
     }
 
     const total = Number(res.headers.get("content-length")) || 0;
+    let buf;
 
     if (res.body && total > 2_000_000) {
       const reader = res.body.getReader();
@@ -139,31 +164,49 @@ export async function downloadEntryToLibrary(root, modelKey, onProgress) {
           });
         }
       }
-      const buf = concatChunks(chunks);
-      await writeLibraryFile(root, dest, buf);
-      onProgress?.({
-        type: "file-done",
-        file: rel,
-        loaded: buf.byteLength,
-        total: buf.byteLength,
-        message: `Saved ${rel}`,
-      });
+      buf = concatChunks(chunks);
     } else {
-      const buf = await res.arrayBuffer();
-      await writeLibraryFile(root, dest, buf);
-      onProgress?.({
-        type: "file-done",
-        file: rel,
-        loaded: buf.byteLength,
-        total: buf.byteLength,
-        message: `Saved ${rel}`,
-      });
+      buf = await res.arrayBuffer();
     }
+
+    if (libraryRoot) {
+      await writeLibraryFile(libraryRoot, dest, buf);
+    }
+    if (returnBuffers) {
+      collected.push({ path: rel, data: buf });
+    }
+
+    onProgress?.({
+      type: "file-done",
+      file: rel,
+      loaded: buf.byteLength,
+      total: buf.byteLength,
+      message: libraryRoot ? `Saved ${rel}` : `Fetched ${rel}`,
+    });
   }
 
   onProgress?.({
     type: "complete",
-    message: `${entry.shortLabel} saved to your model library folder.`,
+    message: libraryRoot
+      ? `${entry.shortLabel} saved to your model library folder.`
+      : `${entry.shortLabel} downloaded.`,
+  });
+
+  return collected;
+}
+
+/**
+ * Download catalog model files from Hugging Face into the user library folder.
+ * @param {FileSystemDirectoryHandle} root
+ * @param {string} modelKey
+ * @param {(ev: object) => void} [onProgress]
+ */
+export async function downloadEntryToLibrary(root, modelKey, onProgress) {
+  await downloadEntryFiles({
+    modelKey,
+    libraryRoot: root,
+    returnBuffers: false,
+    onProgress,
   });
 }
 
