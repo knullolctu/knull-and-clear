@@ -822,7 +822,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = false;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        `Downloads → “${modelLibDirHandle.name}/models/…”. Auto-reads nested packs under this folder.`;
+        `Models + voices: “${modelLibDirHandle.name}/models/onnx-community/Kokoro-…/” (onnx/, voices/, tokenizer).`;
     }
   } else {
     els.modelLibLabel.textContent = "Not set — pick a folder for /models";
@@ -831,7 +831,7 @@ function updateModelLibUi() {
     if (els.rescanModelLibBtn) els.rescanModelLibBtn.hidden = true;
     if (els.modelLibHint) {
       els.modelLibHint.textContent =
-        "Chrome / Edge: choose a root folder. Writes {folder}/models/{model-id}/… and scans nested folders automatically.";
+        "Chrome / Edge: pick a root folder. Layout: {folder}/models/onnx-community/Kokoro-82M-v1.0-ONNX/{onnx,voices,*.json}";
     }
     if (els.modelLibScan) {
       els.modelLibScan.hidden = true;

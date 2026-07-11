@@ -185,6 +185,16 @@ function packMatchScore(packPath, packName, modelId) {
  * @param {string} modelId
  * @returns {Promise<FileSystemDirectoryHandle | null>}
  */
+/**
+ * Canonical pack path (same layout voices use):
+ *   {library}/models/onnx-community/Kokoro-82M-v1.0-ONNX/
+ * @param {string} modelId
+ */
+function canonicalPackRel(modelId) {
+  const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
+  return `models/${id}`.replace(/\/+/g, "/");
+}
+
 async function resolvePackDir(modelId) {
   if (!modelLibraryRoot) return null;
   if (packDirCache.has(modelId)) return packDirCache.get(modelId);
@@ -193,11 +203,16 @@ async function resolvePackDir(modelId) {
   const segments = id.split("/").filter(Boolean);
   const short = segments[segments.length - 1] || id;
   const org = segments.length >= 2 ? segments[0] : "";
-  // If user selected the org folder itself (e.g. "onnx-community") as library root
+  const rootName = (modelLibraryRoot.name || "").toLowerCase();
+  const rootIsModels = rootName === "models";
   const rootIsOrg =
     org &&
     (modelLibraryRoot.name === org ||
       modelLibraryRoot.name.toLowerCase() === org.toLowerCase());
+  const rootIsPack =
+    short &&
+    (modelLibraryRoot.name === short ||
+      modelLibraryRoot.name.toLowerCase() === short.toLowerCase());
 
   const tryRel = async (rel) => {
     try {
@@ -214,29 +229,32 @@ async function resolvePackDir(modelId) {
     return null;
   };
 
-  // Fast paths — order matters for common layouts
+  // Same order as voice downloads: prefer models/{modelId}/ first
   const fast = [
-    // library root = onnx-community → child Kokoro-…
+    // {library}/models/onnx-community/Kokoro-…  ← canonical (voices live here too)
+    canonicalPackRel(id),
+    // library root is the models/ folder
+    rootIsModels ? id : null,
+    rootIsModels ? `${org}/${short}` : null,
+    // library root is onnx-community
     rootIsOrg ? short : null,
-    `models/${id}`,
+    // library root is the pack folder itself
+    rootIsPack ? "" : null,
+    // legacy fallbacks
     id,
-    `models/${short}`,
     short,
-    // library root = models → onnx-community/Kokoro-…
     org ? `${org}/${short}` : null,
-    `models/${org}/${short}`,
-    "", // root is the pack
-  ].filter(Boolean);
+  ].filter((x) => x !== null && x !== undefined);
 
   for (const rel of fast) {
-    const hit = await tryRel(rel);
+    const hit = await tryRel(rel === "" ? "" : rel);
     if (hit) {
       packDirCache.set(modelId, hit);
       return hit;
     }
   }
 
-  // Deep scan + best match
+  // Deep scan: prefer path ending with models/{modelId} or {modelId}
   const packs = await listAllPacks();
   if (packs.length === 0) return null;
 
@@ -244,7 +262,9 @@ async function resolvePackDir(modelId) {
   let bestScore = 0;
   for (const p of packs) {
     let s = packMatchScore(p.path, p.name, id);
-    // Boost when library root is the org folder and child name matches short
+    const path = (p.path || "").replace(/\\/g, "/");
+    if (path === `models/${id}` || path.endsWith(`/models/${id}`)) s += 100;
+    if (path.endsWith(`/${id}`) || path === id) s += 80;
     if (rootIsOrg && p.name.toLowerCase() === short.toLowerCase()) s += 60;
     if (s > bestScore) {
       bestScore = s;
@@ -281,7 +301,9 @@ async function readFromPack(pack, fileRel) {
 }
 
 /**
- * Read from library: fixed models/ path, then nested pack locate.
+ * Read model/voice file from library using the same layout as voices:
+ *   models/onnx-community/Kokoro-82M-v1.0-ONNX/{fileRel}
+ * e.g. onnx/model.onnx, tokenizer.json, voices/af_nicole.bin
  * @param {string} modelId
  * @param {string} fileRel
  */
@@ -289,22 +311,28 @@ async function readFromModelLibrary(modelId, fileRel) {
   if (!modelLibraryRoot) return null;
   const file = String(fileRel || "").replace(/^\/+/, "");
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
-  const short = id.split("/").pop() || id;
 
-  for (const rel of [
-    `models/${id}/${file}`,
-    `${id}/${file}`,
-    `models/${short}/${file}`,
-    `${short}/${file}`,
-    file, // root is the pack
-  ]) {
-    const buf = await readLibraryAbsolute(rel.replace(/\/+/g, "/"));
+  // 1) Canonical path (same base as voice downloads)
+  const canonical = `${canonicalPackRel(id)}/${file}`.replace(/\/+/g, "/");
+  {
+    const buf = await readLibraryAbsolute(canonical);
     if (buf) return buf;
   }
 
-  const pack = await resolvePackDir(modelId);
-  if (!pack) return null;
-  return readFromPack(pack, file);
+  // 2) Resolve pack dir (handles library root = models/ or onnx-community/ or pack)
+  const pack = await resolvePackDir(id);
+  if (pack) {
+    const buf = await readFromPack(pack, file);
+    if (buf) return buf;
+  }
+
+  // 3) Short legacy paths
+  const short = id.split("/").pop() || id;
+  for (const rel of [`${id}/${file}`, `${short}/${file}`, file]) {
+    const buf = await readLibraryAbsolute(rel.replace(/\/+/g, "/"));
+    if (buf) return buf;
+  }
+  return null;
 }
 
 /**

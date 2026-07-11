@@ -1,16 +1,15 @@
 /**
  * User-chosen local model library (File System Access API).
  *
- * Write path (always fixed):
- *   {libraryRoot}/models/{modelId}/config.json
- *   {libraryRoot}/models/{modelId}/onnx/…
- *   {libraryRoot}/models/{modelId}/voices/…
+ * Canonical layout (models + voices share the same pack root):
+ *   {libraryRoot}/models/onnx-community/Kokoro-82M-v1.0-ONNX/
+ *     config.json
+ *     tokenizer.json
+ *     tokenizer_config.json
+ *     onnx/model_quantized.onnx | model.onnx | model_q4.onnx
+ *     voices/af_nicole.bin …
  *
- * Read path auto-scans nested folders so any of these work:
- *   {root}/models/{modelId}/…
- *   {root}/{modelId}/…
- *   {root}/…/models/{modelId}/…  (nested parents)
- *   pack folder found by name match deeper in the tree
+ * Reads prefer that path first (same as voice downloads), then nested fallbacks.
  */
 
 import {
@@ -45,19 +44,20 @@ export function pathInLibrary(modelId, fileRel) {
 export function readPathCandidates(modelId, fileRel) {
   const file = String(fileRel || "").replace(/^\/+/, "");
   const id = String(modelId || "").replace(/^\/+|\/+$/g, "");
-  const short = id.split("/").filter(Boolean).pop() || id;
+  const segments = id.split("/").filter(Boolean);
+  const short = segments[segments.length - 1] || id;
+  const org = segments.length >= 2 ? segments[0] : "";
   /** @type {string[]} */
   const out = [
+    // Canonical — same base as voices/
     `${LIBRARY_MODELS_PREFIX}/${id}/${file}`,
+    // library root is models/
     `${id}/${file}`,
-    // User selected the `models` folder itself
-    `${id.split("/").slice(1).join("/")}/${file}`,
-    // Pack dir only named by last segment
-    `${LIBRARY_MODELS_PREFIX}/${short}/${file}`,
+    // library root is onnx-community
+    org ? `${short}/${file}` : null,
     `${short}/${file}`,
-    file, // flat: root is the pack
-  ];
-  // De-dupe
+    file, // library root is the pack folder
+  ].filter(Boolean);
   return [...new Set(out.map((p) => p.replace(/\/+/g, "/").replace(/^\/+/, "")))];
 }
 
@@ -191,6 +191,8 @@ export async function resolveModelPackDir(root, modelId) {
   const segments = id.split("/").filter(Boolean);
   const short = segments[segments.length - 1] || id;
   const org = segments.length >= 2 ? segments[0] : "";
+  const rootName = (root.name || "").toLowerCase();
+  const rootIsModels = rootName === "models";
   const rootIsOrg =
     org &&
     (root.name === org || root.name.toLowerCase() === org.toLowerCase());
@@ -198,16 +200,17 @@ export async function resolveModelPackDir(root, modelId) {
   // Root itself is the pack
   if (await isModelPackDir(root)) return root;
 
-  // Fast path: fixed write locations + org-as-root
+  // Prefer models/{modelId} — same folder voices download into
   const directPaths = [
-    rootIsOrg ? short : null,
     `${LIBRARY_MODELS_PREFIX}/${id}`,
+    rootIsModels ? id : null,
+    rootIsOrg ? short : null,
     id,
     short,
-    `${LIBRARY_MODELS_PREFIX}/${short}`,
     org ? `${org}/${short}` : null,
-    `${LIBRARY_MODELS_PREFIX}/${org}/${short}`,
+    `${LIBRARY_MODELS_PREFIX}/${short}`,
   ].filter(Boolean);
+
   for (const rel of directPaths) {
     try {
       const parts = rel.split("/").filter(Boolean);
@@ -229,13 +232,13 @@ export async function resolveModelPackDir(root, modelId) {
     const path = (p.path || "").replace(/\\/g, "/");
     const name = p.name || "";
     let score = 0;
-    if (path === id || path === `models/${id}`) score += 100;
-    if (path.endsWith(`/${id}`) || path.endsWith(id)) score += 80;
+    if (path === `models/${id}` || path.endsWith(`/models/${id}`)) score += 120;
+    if (path === id || path.endsWith(`/${id}`)) score += 90;
     if (path.includes(id)) score += 50;
     if (name === short || name.toLowerCase() === short.toLowerCase()) score += 40;
     if (rootIsOrg && name.toLowerCase() === short.toLowerCase()) score += 60;
     if (path.toLowerCase().includes(short.toLowerCase())) score += 25;
-    if (segments[0] && path.includes(segments[0])) score += 10;
+    if (org && path.includes(org)) score += 10;
     if (/kokoro/i.test(name) && /kokoro/i.test(short)) score += 15;
     if (score > bestScore) {
       bestScore = score;
