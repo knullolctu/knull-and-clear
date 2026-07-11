@@ -12,7 +12,7 @@ import {
   downloadEntryFiles,
   downloadVoicesToLibrary,
   isEntryInLibrary,
-  readLibraryModelFile,
+  resolveModelPackDir,
   scanLibraryCatalog,
 } from "./modelLibrary.js";
 import { ENGLISH_VOICES } from "./modelCatalog.js";
@@ -701,25 +701,61 @@ function updateVoiceDownloadButtons() {
   });
 }
 
+/**
+ * Fast on-disk voice check: resolve pack once, then probe voices/ only.
+ * Avoids re-scanning the whole library tree per voice (that hung the UI).
+ */
 async function refreshVoiceOnDiskStatus() {
-  if (!modelLibDirHandle || !(await ensureDirPermission(modelLibDirHandle))) {
-    voiceOnDisk.clear();
+  const ids = voiceOptions.length
+    ? voiceOptions.map((v) => v.value)
+    : ENGLISH_VOICES.slice();
+
+  if (!modelLibDirHandle) {
+    for (const id of ids) voiceOnDisk.set(id, false);
     updateVoiceDownloadButtons();
     return;
   }
+
+  let permitted = false;
+  try {
+    permitted = await ensureDirPermission(modelLibDirHandle);
+  } catch {
+    permitted = false;
+  }
+  if (!permitted) {
+    for (const id of ids) voiceOnDisk.set(id, false);
+    updateVoiceDownloadButtons();
+    return;
+  }
+
   const entry = getModelEntry(selectedModelKey);
-  const ids = voiceOptions.length
-    ? voiceOptions.map((v) => v.value)
-    : ENGLISH_VOICES;
+  /** @type {FileSystemDirectoryHandle | null} */
+  let voicesDir = null;
+  try {
+    const pack = await resolveModelPackDir(modelLibDirHandle, entry.modelId);
+    if (pack) {
+      try {
+        voicesDir = await pack.getDirectoryHandle("voices");
+      } catch {
+        voicesDir = null;
+      }
+    }
+  } catch {
+    voicesDir = null;
+  }
+
+  if (!voicesDir) {
+    for (const id of ids) voiceOnDisk.set(id, false);
+    updateVoiceDownloadButtons();
+    return;
+  }
+
   await Promise.all(
     ids.map(async (id) => {
       try {
-        const buf = await readLibraryModelFile(
-          modelLibDirHandle,
-          entry.modelId,
-          `voices/${id}.bin`,
-        );
-        voiceOnDisk.set(id, Boolean(buf && buf.byteLength > 1000));
+        const fh = await voicesDir.getFileHandle(`${id}.bin`);
+        const f = await fh.getFile();
+        voiceOnDisk.set(id, f.size > 1000);
       } catch {
         voiceOnDisk.set(id, false);
       }
@@ -1100,6 +1136,7 @@ function populateModelMenu() {
 }
 
 function openVoiceMenu() {
+  if (voiceOptions.length === 0) seedVoiceMenuIfEmpty();
   if (els.voiceTrigger.disabled || voiceOptions.length === 0) return;
   closeModelMenu();
   voiceMenuOpen = true;
@@ -1112,7 +1149,10 @@ function openVoiceMenu() {
     voiceOptions.findIndex((v) => v.value === selectedVoice),
   );
   setVoiceActiveIndex(idx);
-  refreshVoiceOnDiskStatus().catch(() => {});
+  // Debounced light badge refresh (must not block menu open)
+  queueMicrotask(() => {
+    refreshVoiceOnDiskStatus().catch(() => {});
+  });
 }
 
 function toggleVoiceMenu() {
@@ -1225,13 +1265,36 @@ function populateVoices(voices) {
     }
   }
 
-  const initial =
+  const prefer =
+    (selectedVoice &&
+    [...(voices ? Object.keys(voices) : []), ...ENGLISH_VOICES].includes(
+      selectedVoice,
+    )
+      ? selectedVoice
+      : null) ||
     (voices && voices.af_heart && "af_heart") ||
     voiceOptions[0]?.value ||
     "af_heart";
-  setSelectedVoice(initial, { close: true });
-  els.voiceTrigger.disabled = !ready || generating;
-  refreshVoiceOnDiskStatus().catch(() => {});
+  setSelectedVoice(prefer, { close: true });
+  // Enable picker as soon as we have a list (downloads work before model load)
+  els.voiceTrigger.disabled = generating;
+  // Non-blocking disk badges
+  queueMicrotask(() => {
+    refreshVoiceOnDiskStatus().catch(() => {});
+  });
+}
+
+/** Seed voice menu immediately so refresh never sticks on “Loading voices…”. */
+function seedVoiceMenuIfEmpty() {
+  if (voiceOptions.length > 0) return;
+  /** @type {Record<string, { name?: string }>} */
+  const stub = {};
+  for (const id of ENGLISH_VOICES) {
+    stub[id] = { name: id.replace(/_/g, " ") };
+  }
+  populateVoices(stub);
+  els.voiceTriggerText.textContent = "Select voice…";
+  els.voiceTrigger.disabled = false;
 }
 
 /* ── IndexedDB helpers for directory handle ───────────────────────── */
@@ -1971,6 +2034,7 @@ async function main() {
   updateSpeedLabel();
   loadLocalSettings();
   populateModelMenu();
+  seedVoiceMenuIfEmpty();
   bindEvents();
   await restoreSaveDirectory();
 
@@ -1978,7 +2042,8 @@ async function main() {
   hideOverlay();
   if (els.modelTrigger) els.modelTrigger.disabled = false;
   if (els.generateBtn) els.generateBtn.disabled = true;
-  if (els.voiceTrigger) els.voiceTrigger.disabled = true;
+  // Voice list is seeded; don't leave trigger stuck on "Loading voices…"
+  if (els.voiceTrigger) els.voiceTrigger.disabled = false;
   if (els.deviceBadge) els.deviceBadge.textContent = "device: — · setup";
 
   // If we have a saved handle, confirm permission still works

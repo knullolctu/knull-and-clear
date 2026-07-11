@@ -615,28 +615,16 @@ async function purgeBadVoiceCache() {
 }
 
 /**
- * Prefer the English voices we self-host. One cheap HEAD on af_heart.bin
- * instead of probing every file (avoids a flood of requests on load).
+ * Prefer the English voice catalog (no FS I/O — scanning library here
+ * stalled load at "Preparing voices…" on every refresh).
  */
-async function filterVoicesToLocal(voices) {
+function filterVoicesToLocal(voices) {
   if (!voices || typeof voices !== "object") return voices;
-
-  let inLibrary = false;
-  if (modelLibraryRoot) {
-    const buf = await readFromModelLibrary(MODEL_ID, "voices/af_heart.bin");
-    if (buf && buf.byteLength >= MIN_VOICE_BYTES) inLibrary = true;
-    if (!inLibrary) {
-      const buf2 = await readFromModelLibrary(V1_MODEL_ID, "voices/af_heart.bin");
-      if (buf2 && buf2.byteLength >= MIN_VOICE_BYTES) inLibrary = true;
-    }
-  }
-
-  if (!inLibrary) return voices;
-
   const local = {};
   for (const id of LOCAL_ENGLISH_VOICES) {
     if (voices[id]) local[id] = voices[id];
   }
+  // If kokoro only exposed a subset, keep that; else fall back to full map
   return Object.keys(local).length > 0 ? local : voices;
 }
 
@@ -1346,7 +1334,7 @@ async function init(modelKey) {
       message: "Model weights ready — preparing voices…",
     });
 
-    const voices = await filterVoicesToLocal(tts.voices);
+    const voices = filterVoicesToLocal(tts.voices);
     if (gen !== loadGeneration) return;
 
     self.postMessage({
